@@ -23,7 +23,7 @@
 # **必须在第一个 FROM 之前声明**——FROM 只能引用此前定义的 ARG。
 # 且它在每个构建阶段都要重新声明一次(ARG 的作用域到阶段结束)。
 ARG DOCKER_MIRROR
-ARG NODE_IMAGE=node:22-slim
+ARG NODE_IMAGE=docker.m.daocloud.io/node:22-slim
 
 FROM ${DOCKER_MIRROR:+${DOCKER_MIRROR}/library/}${NODE_IMAGE} AS builder
 WORKDIR /app
