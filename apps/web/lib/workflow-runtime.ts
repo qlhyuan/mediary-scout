@@ -757,10 +757,12 @@ export async function getWorkflowStatusView(
   if (!firstTracked) {
     return null;
   }
+  // Read the spotlight season on the SAME drive it was picked from — the same
+  // season may be tracked on other drives with different episode states.
   return getTrackedSeasonStatusView({
     repository: targetRepository,
     trackedSeasonId: firstTracked.season.id,
-    accountId: resolvedAccountId,
+    scope: { accountId: resolvedAccountId, connectedStorageId: firstTracked.connectedStorageId },
   });
 }
 
@@ -1693,7 +1695,11 @@ function targetFromSearchCandidate(
     id: candidateId,
     mediaTitleId: title.id,
     seasonNumber,
-    status: season.latestAiredEpisode >= season.episodeCount ? "completed" : "active",
+    // Freshly tracked = nothing obtained yet → "active" even for a 完结 show.
+    // The bridge grades it "completed" only once fully obtained (see
+    // workflow-v2-bridge bridgeSeason). Marking it completed on airing alone made
+    // the patrol skip 完结剧-with-gaps forever.
+    status: "active",
     qualityPreference: defaultQuality(),
     storageDirectoryId: storageDirectoryIdForCandidate(candidateId),
     totalEpisodes: season.episodeCount,
