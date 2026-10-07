@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { MediaTitle, TrackedSeason, WorkflowRun } from "../src/domain.js";
 import type { PersistedWorkflowRunSnapshot, PersistWorkflowRunSnapshotInput } from "../src/repository.js";
 import { QuarkAuthError } from "../src/quark-cookie-client.js";
+import { attachStagingLeaks } from "../src/acquisition-v2/directory-lifecycle.js";
 import { handleWorkflowRunFailure } from "../src/worker.js";
 
 const title: MediaTitle = {
@@ -182,6 +183,72 @@ describe("handleWorkflowRunFailure", () => {
     expect(saved.notifications[0]?.report?.status).toBe("failed");
   });
 
+  it("persists staging_leaked audit events carried on the error into the FAILED run (Copilot #260 r1)", async () => {
+    // A leak detected by withStagingCleanup on the throw path rides on the error;
+    // the failure handler is the only code that persists that run, so it must
+    // append the event — otherwise a failed run can leave 1.4 TB behind unseen.
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    const error = attachStagingLeaks(new Error("agent gave up: no coverage"), [
+      {
+        stagingDirectoryId: "stg-77",
+        showDirectoryId: "show-7",
+        error: new Error("PAN123_TRASH_NOOP: did not act on stg-77"),
+      },
+    ]);
+    await handleWorkflowRunFailure({
+      claimed: snapshot(),
+      error,
+      repository: { saveWorkflowRunSnapshot: save },
+      now,
+    });
+    const saved = save.mock.calls[0]![0];
+    expect(saved.workflowRun.status).toBe("failed");
+    const leak = saved.workflowRun.auditEvents.find((event) => event.type === "staging_leaked");
+    expect(leak).toBeDefined();
+    // Same shape as the success path (Copilot #260 r2): the show dir rides along so
+    // a hand cleanup knows WHERE the leaked staging dir lives.
+    expect(leak?.data).toMatchObject({
+      stagingDirectoryId: "stg-77",
+      showDirectoryId: "show-7",
+      cleanupError: expect.stringContaining("PAN123_TRASH_NOOP"),
+    });
+    // the failure itself is still recorded
+    expect(saved.workflowRun.auditEvents.some((event) => event.type === "workflow_failed")).toBe(true);
+  });
+
+  it("persists staging_leaked audit events on the REQUEUED run too (transient failure + surviving staging)", async () => {
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    const error = attachStagingLeaks(new Error("read ECONNRESET"), [
+      { stagingDirectoryId: "stg-78", showDirectoryId: "show-8" },
+    ]);
+    const out = await handleWorkflowRunFailure({
+      claimed: snapshot(),
+      error,
+      repository: { saveWorkflowRunSnapshot: save },
+      now,
+    });
+    expect(out.status).toBe("auto_requeued");
+    const saved = save.mock.calls[0]![0];
+    expect(saved.workflowRun.auditEvents.some((event) => event.type === "staging_leaked")).toBe(true);
+  });
+
+  it("attaching leaks does NOT change the error's identity: a brand auth error still freezes the drive", async () => {
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    const onAuthErrorFreeze = vi.fn(async (_storageId: string, _reason: string) => {});
+    const error = attachStagingLeaks(new QuarkAuthError("QUARK_AUTH_FAILED: require login"), [
+      { stagingDirectoryId: "stg-79", showDirectoryId: "show-9" },
+    ]);
+    await handleWorkflowRunFailure({
+      claimed: snapshot(),
+      error,
+      repository: { saveWorkflowRunSnapshot: save },
+      now,
+      onAuthErrorFreeze,
+    });
+    expect(onAuthErrorFreeze).toHaveBeenCalledTimes(1);
+    expect(save.mock.calls[0]![0].workflowRun.auditEvents.some((event) => event.type === "staging_leaked")).toBe(true);
+  });
+
   it("freezes the connected drive once on brand QuarkAuthError", async () => {
     const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
     const onAuthErrorFreeze = vi.fn(async (_storageId: string, _reason: string) => {});
@@ -223,5 +290,90 @@ describe("handleWorkflowRunFailure", () => {
       }),
     ).resolves.toMatchObject({ status: "failed" });
     expect(onAuthErrorFreeze).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleWorkflowRunFailure — model content-filter before any transfer", () => {
+  it("terminal failure naming the model, not a retry and not no-coverage (《出入平安》)", async () => {
+    const { AgentContentFilterError } = await import("../src/agent-error.js");
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    const out = await handleWorkflowRunFailure({
+      claimed: snapshot(),
+      error: new AgentContentFilterError(),
+      repository: { saveWorkflowRunSnapshot: save },
+      now,
+    });
+    expect(out.status).toBe("failed");
+    const saved = save.mock.calls[0]![0];
+    expect(saved.workflowRun.status).toBe("failed");
+    const report = saved.notifications[0]?.report;
+    expect(report?.status).toBe("failed");
+    expect(report?.lines.join("\n")).toContain("内容审查");
+    expect(report?.lines.join("\n")).toContain("不是没有资源");
+  });
+});
+
+describe("handleWorkflowRunFailure — stdout trail", () => {
+  it("logs one secret-safe line per failure (the 出入平安 cause was only recoverable from dead heap tuples)", async () => {
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await handleWorkflowRunFailure({
+        claimed: snapshot(),
+        error: new Error("PAN123_REQUEST_FAILED(yun.123pan.com /file/list): TimeoutError token=abcdefghijklmnop"),
+        repository: { saveWorkflowRunSnapshot: save },
+        now,
+      });
+      const lines = spy.mock.calls.map((c) => String(c[0]));
+      const line = lines.find((l) => l.startsWith("[workflow] run r1"));
+      expect(line).toBeDefined();
+      expect(line).toContain("movie_init");
+      expect(line).toContain("auto_requeued");
+      expect(line).toContain("yun.123pan.com");
+      expect(line).not.toContain("abcdefghijklmnop");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("handleWorkflowRunFailure — log survives a failing save", () => {
+  it("writes the stdout line even when persistence rejects", async () => {
+    const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const save = vi.fn(async () => { throw new Error("db down"); });
+      await expect(
+        handleWorkflowRunFailure({ claimed: snapshot(), error: new Error("boom"), repository: { saveWorkflowRunSnapshot: save }, now }),
+      ).rejects.toThrow("db down");
+      expect(spy.mock.calls.map((c) => String(c[0])).some((l) => l.startsWith("[workflow] run r1") && l.includes("boom"))).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("handleWorkflowRunFailure — terminal failure push is redacted", () => {
+  it("a non-retried failure never pushes a raw token, but the run row keeps the raw message", async () => {
+    const save = vi.fn(async (_input: PersistWorkflowRunSnapshotInput) => {});
+    await handleWorkflowRunFailure({
+      claimed: snapshot(),
+      error: new Error("PAN123_FAILED(/x): code=5 bad cookie=UID_abcdefghijkl"),
+      repository: { saveWorkflowRunSnapshot: save },
+      now,
+    });
+    const saved = save.mock.calls[0]![0];
+    expect(saved.workflowRun.status).toBe("failed");
+    const push = [saved.notifications[0]!.body, ...(saved.notifications[0]!.report?.lines ?? [])].join("\n");
+    expect(push).not.toContain("UID_abcdefghijkl");
+    expect(push).toContain("PAN123_FAILED");
+  });
+});
+
+describe("summarizeErrorForNotification — bare secret names", () => {
+  it("redacts token=/cookie= with no name prefix, and keeps a short harmless value", async () => {
+    const { summarizeErrorForNotification } = await import("../src/agent-error.js");
+    expect(summarizeErrorForNotification("x token=abcdefghijkl y")).toBe("x token=*** y");
+    expect(summarizeErrorForNotification("cookie: UID=12345678_abc")).not.toContain("12345678_abc");
+    expect(summarizeErrorForNotification("key=ab")).toBe("key=ab");
   });
 });

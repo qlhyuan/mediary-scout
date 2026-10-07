@@ -57,19 +57,36 @@ export interface StorageExecutor {
    *  loop's budget soft-warning. Optional: only the real 115 executor implements it;
    *  fakes/sims omit it. */
   apiCallCount?(): number;
-  /** The configured HARD 115 call budget — lets the agent loop derive its SOFT
-   *  warning threshold from the real limit. Optional (real 115 executor only). */
+  /** The agent-facing 115 call budget (hard limit minus the harness cleanup
+   *  reserve). The agent loop derives its SOFT warning from this. Optional
+   *  (real 115 executor only). */
   apiCallBudget?(): number;
+  /** Run `fn` on the harness cleanup reserve. Executors without a per-run budget
+   *  omit it; withStagingCleanup uses it when present. */
+  withCleanupBudget?<T>(fn: () => Promise<T>): Promise<T>;
   /** Subtitle direct-link landing. Submits the http url as a drive offline task
    *  and confirms the named file landed via listTree (NOT listVideoFiles —
    *  subtitle extensions are invisible to that path). Optional AND the
    *  capability gate: the orchestrator enables the whole subtitle flow iff this
-   *  method exists on the executor (today only 115 implements it; implementing
-   *  it on 光鸭/夸克 lights subtitles up there with zero other wiring). */
+   *  method exists on the executor (today 115 / 光鸭 / 123 implement it; 夸克 and
+   *  天翼 have no offline-download API — implementing it lights subtitles up with
+   *  zero other wiring). */
   transferSubtitleUrl?(input: {
     url: string;
     filename: string;
     directoryId: string;
     workflowRunId: string;
   }): Promise<TransferAttempt>;
+  /** Batch subtitle landing — submits EVERY file up front and confirms landings
+   *  with ONE directory listing per poll round for all of them. Brands whose
+   *  per-file cost is dominated by the landing poll (115: the 2026-09-20 LIAR GAME
+   *  run spent 260 of 300 calls on one 22-file package) implement it; the V2
+   *  adapter uses it when present and otherwise loops transferSubtitleUrl. Returns
+   *  one attempt per input file, in input order. Optional: the capability gate stays
+   *  transferSubtitleUrl. */
+  transferSubtitleUrls?(input: {
+    files: Array<{ url: string; filename: string }>;
+    directoryId: string;
+    workflowRunId: string;
+  }): Promise<TransferAttempt[]>;
 }

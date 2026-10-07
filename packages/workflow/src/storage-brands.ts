@@ -25,6 +25,7 @@ export type ResourceProviderKind =
   | "pansou-magnet"
   | "pansou-tianyi"
   | "pansou-123"
+  | "pansou-guangya"
   | "prowlarr";
 
 export interface StorageBrand {
@@ -40,7 +41,7 @@ export interface StorageBrand {
   /** Whether an error is this brand's dead-credential signal (drives freeze on it). */
   isAuthError: (err: unknown) => boolean;
   /** Resource providers applicable to this brand. Share-link brands (夸克/天翼)
-   *  have no magnet web API, so they omit "prowlarr" — magnet is 115/光鸭 only. */
+   *  have no magnet web API, so they omit "prowlarr" — magnet is 115/光鸭/123 only. */
   resourceProviderKinds: ResourceProviderKind[];
   /** Whether to strengthen the Chinese-subs soft default for this brand. When true,
    *  the agent prompt emphasizes that Chinese-titled resources from this drive are
@@ -66,6 +67,12 @@ export interface StorageBrand {
    *  key is present (the client trims/validates the rest downstream). Undefined
    *  for cookie brands (115/夸克), which authenticate with a cookie string. */
   requiredCredentialKeys?: string[];
+  /** How the brand's executor decides a write is inside the drive's scope.
+   *  "parents": it looks the target's parents up on the drive until it reaches a scope
+   *  root (115 / 夸克). "listed": it only writes into a scope root, a dir it created, or
+   *  a dir it listed under an in-scope parent in this run (光鸭 / 天翼 / 123) — a dir id
+   *  handed over from another run must be reached again from a scope root first. */
+  writeScope: "parents" | "listed";
 }
 
 export const STORAGE_BRANDS: StorageBrand[] = [
@@ -78,6 +85,7 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     assumeChineseSubsFromChineseTitle: true,
     authKind: "cookie",
     provisionRootId: "0", // 115 account root
+    writeScope: "parents",
   },
   {
     provider: "quark",
@@ -88,17 +96,20 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     assumeChineseSubsFromChineseTitle: true,
     authKind: "cookie",
     provisionRootId: "0", // 夸克 account root
+    writeScope: "parents",
   },
   {
     provider: "guangya",
     label: "光鸭云盘",
     parseUid: parseGuangYaUid,
     isAuthError: isGuangYaAuthError,
-    resourceProviderKinds: ["pansou-magnet", "prowlarr"],
+    // Own share links (restore_share, 2026-09) + magnet/offline — dual path like 123.
+    resourceProviderKinds: ["pansou-guangya", "pansou-magnet", "prowlarr"],
     assumeChineseSubsFromChineseTitle: false,
     authKind: "token",
     provisionRootId: "", // 光鸭 account root
     requiredCredentialKeys: ["accessToken", "refreshToken"],
+    writeScope: "listed",
   },
   {
     provider: "tianyi",
@@ -110,6 +121,7 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     authKind: "token",
     provisionRootId: "-11", // 天翼个人云 root folder id
     requiredCredentialKeys: ["sessionKey", "accessToken", "refreshToken"],
+    writeScope: "listed",
   },
   {
     provider: "pan123",
@@ -122,13 +134,14 @@ export const STORAGE_BRANDS: StorageBrand[] = [
     authKind: "token",
     provisionRootId: "0", // 123 个人云根
     requiredCredentialKeys: ["token"],
+    writeScope: "listed",
   },
 ];
 
 /**
  * Map a brand's resource-provider kinds to the PanSou link types its acquisitions
- * may transfer. A 夸克 drive can only save 夸克 share links; a 光鸭(磁力) drive can
- * only offline-download magnets; a 115 drive takes both 115 links and magnets.
+ * may transfer. A 夸克 drive can only save 夸克 share links; 光鸭 / 123 / 115 take
+ * their OWN share links plus magnets (光鸭: restore_share + offline download).
  * Pure + brand-table-driven so the resource assembly stays testable.
  */
 export function allowedResourceTypesForKinds(kinds: readonly string[]): ResourceType[] {
@@ -143,6 +156,12 @@ export function allowedResourceTypesForKinds(kinds: readonly string[]): Resource
     return kinds.includes("prowlarr") || kinds.includes("pansou-magnet")
       ? ["123", "magnet"]
       : ["123"];
+  }
+  // 光鸭 share + magnet when a magnet source is also listed (dual-path brand).
+  if (kinds.includes("pansou-guangya")) {
+    return kinds.includes("prowlarr") || kinds.includes("pansou-magnet")
+      ? ["guangya", "magnet"]
+      : ["guangya"];
   }
   if (kinds.includes("pansou-magnet")) {
     return ["magnet"];
@@ -164,6 +183,16 @@ export function isRegisteredStorageProvider(provider: string): provider is Stora
   return STORAGE_BRANDS.some((b) => b.provider === provider);
 }
 
+/** Whether the drive's executor writes only where it listed or created in this run
+ *  (see StorageBrand.writeScope). False for unknown or missing providers. */
+export function brandWritesOnlyListedDirectories(provider: string | undefined): boolean {
+  return (
+    provider !== undefined &&
+    isRegisteredStorageProvider(provider) &&
+    getStorageBrand(provider).writeScope === "listed"
+  );
+}
+
 /** Whether a brand can use Prowlarr (磁力/PT) — 115 yes, 夸克 no (no magnet API).
  *  Settings hides the Prowlarr block when no connected drive supports it. Safe on
  *  unknown providers (returns false, never throws). */
@@ -171,5 +200,15 @@ export function brandSupportsProwlarr(provider: string): boolean {
   return (
     isRegisteredStorageProvider(provider) &&
     getStorageBrand(provider).resourceProviderKinds.includes("prowlarr")
+  );
+}
+
+/** Display labels of every registered brand that can use Prowlarr, in registry
+ *  order. Settings derives "which drives magnet works on" from this instead of a
+ *  hand-written note — the old 「仅对 115 盘生效」 went stale the day 光鸭/123 gained
+ *  magnet. Same source of truth as brandSupportsProwlarr. */
+export function brandsSupportingProwlarr(): string[] {
+  return STORAGE_BRANDS.filter((brand) => brand.resourceProviderKinds.includes("prowlarr")).map(
+    (brand) => brand.label,
   );
 }

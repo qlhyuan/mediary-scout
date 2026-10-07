@@ -1,3 +1,4 @@
+import type { AgentMemoryStore } from "../agent-memory.js";
 import type { LanguageModel } from "ai";
 import type { MediaTitle } from "../domain.js";
 import type { ResourceProvider, StorageExecutor } from "../ports.js";
@@ -8,7 +9,8 @@ import {
   type V2BridgeSeasonIntent,
 } from "./workflow-v2-bridge.js";
 import type { DeadLinkStore } from "./dead-links.js";
-import { runAcquisitionV2Workflow } from "./workflow-v2.js";
+import type { JevJudge } from "../jev-judge.js";
+import { runAcquisitionV2Workflow, type RunAcquisitionV2WorkflowRequest } from "./workflow-v2.js";
 import { getQualityGuidance, getSearchRecipe, searchProfile } from "./search-profile.js";
 import type { AgentToolEvent } from "./activity.js";
 
@@ -45,7 +47,21 @@ export interface RunTvAcquisitionV2Request {
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
+  /** Optional Jev candidate prefilter (Settings); resolved per account by the worker. */
+  jevJudge?: JevJudge;
   deadLinkStore?: DeadLinkStore;
+  /** Agent memory (see orchestrator.memory). */
+  memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
+  /** A replace_request run (see orchestrator.userRequest). */
+  userRequest?: RunAcquisitionV2WorkflowRequest["userRequest"];
+  /** See orchestrator.protectExisting. */
+  protectExisting?: RunAcquisitionV2WorkflowRequest["protectExisting"];
+  /** See orchestrator.rejectedLookup. */
+  rejectedLookup?: RunAcquisitionV2WorkflowRequest["rejectedLookup"];
+  /** See orchestrator.linkHistory. */
+  linkHistory?: RunAcquisitionV2WorkflowRequest["linkHistory"];
+  /** Leftover staging dir adopted as this run's staging. See workflow-v2. */
+  stagingRecovery?: RunAcquisitionV2WorkflowRequest["stagingRecovery"];
   onProgress?: (event: AgentToolEvent) => void;
   now?: () => string;
 }
@@ -88,16 +104,24 @@ export async function runTvAcquisitionV2(request: RunTvAcquisitionV2Request): Pr
     ...(request.title.originCountries === undefined ? {} : { originCountries: request.title.originCountries }),
     ...(request.storageProvider === undefined ? {} : { storageProvider: request.storageProvider }),
     ...(request.assrtToken === undefined ? {} : { assrtToken: request.assrtToken }),
+    ...(request.jevJudge === undefined ? {} : { jevJudge: request.jevJudge }),
     ...(request.deadLinkStore ? { deadLinkStore: request.deadLinkStore } : {}),
+    ...(request.memory ? { memory: request.memory } : {}),
+    ...(request.userRequest ? { userRequest: request.userRequest } : {}),
+    ...(request.protectExisting ? { protectExisting: request.protectExisting } : {}),
+    ...(request.rejectedLookup ? { rejectedLookup: request.rejectedLookup } : {}),
+    ...(request.linkHistory ? { linkHistory: request.linkHistory } : {}),
+    ...(request.stagingRecovery ? { stagingRecovery: request.stagingRecovery } : {}),
     ...(request.onProgress ? { onProgress: request.onProgress } : {}),
   });
 
-  return bridgeV2WorkflowToResult({
+  const bridged = bridgeV2WorkflowToResult({
     title: request.title,
-    mode: request.mode,
+    mode: request.stagingRecovery ? "staging_recovery" : request.mode,
     seasons: request.seasons,
     v2,
     workflowRunId: request.workflowRunId,
     now: request.now ?? defaultNowIso,
   });
+  return v2.replacement ? { ...bridged, replacement: v2.replacement } : bridged;
 }

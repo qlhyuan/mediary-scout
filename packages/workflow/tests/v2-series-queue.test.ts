@@ -6,6 +6,8 @@ import {
   InMemoryWorkflowRepository,
   queueSeriesInitialization,
   runQueuedSeriesInitialization,
+  type JevJudge,
+  type JevJudgeInput,
   type MediaTitle,
 } from "../src/index.js";
 
@@ -131,6 +133,19 @@ describe("queueSeriesInitialization + runQueuedSeriesInitialization (live series
     });
     expect(again.status).toBe("already_running");
 
+    // An update hold: nothing is claimed, the run stays queued.
+    const held = await runQueuedSeriesInitialization({
+      repository,
+      resourceProvider: new FakeResourceProvider({ keywordResults: {} }),
+      storage: new FakeStorageExecutor(),
+      model: inspectAndMarkModel([]),
+      storageParentDirectoryId: "library_root",
+      now: () => "2026-06-13T00:02:00.000Z",
+      mayStartRun: () => false,
+    });
+    expect(held).toEqual({ status: "idle" });
+    expect((await repository.getWorkflowRunSnapshot("run_series_q"))!.workflowRun.status).toBe("queued");
+
     // Seed both seasons' canonical V2 dirs as already complete (all aired
     // episodes present in 115). The agent inspects, sees them, and marks them
     // from that evidence (§6b#8) — succeeded. S1: 2/2 aired; S2: 2/3 aired.
@@ -218,5 +233,50 @@ describe("queueSeriesInitialization + runQueuedSeriesInitialization (live series
     const [state] = await repository.listTrackedSeasonStates();
     expect(state?.season.storageDirectoryId.startsWith("anime_root_")).toBe(true);
     expect(state?.season.storageDirectoryId.includes("tv_root")).toBe(false);
+  });
+});
+
+/**
+ * Chain guard (2026-09-20). The live A/B ran with the prefilter ON and still
+ * persisted `prefilter: null`: worker.ts spreads `jevJudge` into runner-v2's
+ * persist input, whose type never declared it — TypeScript does not
+ * excess-property-check spread expressions, so the judge was silently dropped
+ * one hop below the worker. These tests therefore enter at the WORKER entry
+ * point (not at runAcquisitionV2Workflow) so every hop is covered.
+ */
+describe("runQueuedSeriesInitialization — the Jev prefilter reaches the engine", () => {
+  it("runs the per-account judge over the series' candidates (worker → runner-v2 → run-tv-v2 → workflow)", async () => {
+    const repository = new InMemoryWorkflowRepository();
+    await queueSeriesInitialization({
+      title: theBoys,
+      seasons,
+      keyword: "黑袍纠察队 4K",
+      repository,
+      createWorkflowRunId: () => "run_jev_series",
+      now: () => "2026-06-13T00:00:00.000Z",
+    });
+
+    const seen: JevJudgeInput[] = [];
+    const jevJudge: JevJudge = {
+      judgeCandidates: async (input) => {
+        seen.push(input);
+        return { scores: {}, model: "m" };
+      },
+    };
+
+    await runQueuedSeriesInitialization({
+      repository,
+      resourceProvider: new FakeResourceProvider({
+        keywordResults: { [theBoys.title]: [{ title: "黑袍纠察队.The.Boys.S01.2160p" }] },
+      }),
+      storage: new FakeStorageExecutor(),
+      model: noCoverageModel(),
+      storageParentDirectoryId: "library_root",
+      now: () => "2026-06-13T00:05:00.000Z",
+      resolveAccountContext: async () => ({ jevJudge }),
+    });
+
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen[0]!.target.kind).toBe("tv");
   });
 });

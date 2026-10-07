@@ -1,3 +1,4 @@
+import { parseGuangYaShareUrl } from "./guangya-client.js";
 import { createHash } from "node:crypto";
 import type {
   ResourceCandidate,
@@ -26,6 +27,34 @@ export interface PanSouFetchInit {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+/** PanSou searches in progress per server, across every provider in this process.
+ *  One PanSou fans each search out to dozens of channels and starts answering 502
+ *  at about four simultaneous searches (measured 2026-09-25); parallel patrol runs
+ *  share it, so their searches queue here instead of failing as "source down". */
+const MAX_IN_FLIGHT_PER_SERVER = 2;
+const serverSlots = new Map<string, { inFlight: number; waiters: Array<() => void> }>();
+
+async function withServerSlot<T>(baseURL: string, call: () => Promise<T>): Promise<T> {
+  let slot = serverSlots.get(baseURL);
+  if (!slot) {
+    slot = { inFlight: 0, waiters: [] };
+    serverSlots.set(baseURL, slot);
+  }
+  if (slot.inFlight >= MAX_IN_FLIGHT_PER_SERVER) {
+    await new Promise<void>((resolve) => slot!.waiters.push(resolve));
+  } else {
+    slot.inFlight += 1;
+  }
+  try {
+    return await call();
+  } finally {
+    // Hand the slot straight to the next waiter (inFlight unchanged), or free it.
+    const next = slot.waiters.shift();
+    if (next) next();
+    else if ((slot.inFlight -= 1) === 0) serverSlots.delete(baseURL);
+  }
+}
 
 export type PanSouFetchJson = (url: string, init: PanSouFetchInit) => Promise<unknown>;
 
@@ -98,13 +127,19 @@ export class PanSouResourceProvider implements ResourceProvider {
     if (!isPanSouSuccessResponse(response)) {
       throw new PanSouProtocolError(`not a PanSou payload from ${this.baseURL}`);
     }
-    const facts = collectLinkFacts(response.data.results);
+    const facts = collectLinkFacts(response.data.results ?? []);
     // Per-brand filter: a quark drive only sees quark links; a 115 drive only
     // sees 115/magnet. Keeps a candidate set that its executor can actually transfer.
     return this.allowedTypes ? facts.filter((fact) => this.allowedTypes!.has(fact.type)) : facts;
   }
 
   async search(input: { keyword: string; workflowRunId?: string }): Promise<ResourceSnapshot> {
+    // The slot covers the whole poll loop, not each request: between polls PanSou
+    // is still fanning the search out to its channels, which is the load that 502s.
+    return withServerSlot(this.baseURL, () => this.pollSearch(input));
+  }
+
+  private async pollSearch(input: { keyword: string; workflowRunId?: string }): Promise<ResourceSnapshot> {
     // PanSou is async/streaming: the first call returns quick cached results and
     // async-plugin results land on LATER calls (5 → 35 115-links, 0 → 419
     // magnets). Poll until the link count stops growing so the agent always
@@ -192,16 +227,47 @@ function isPanSouErrorResponse(value: unknown): boolean {
   return typeof value["code"] === "number" && value["code"] !== 0;
 }
 
+/** PanSou `SearchResponse` data (fish2018/pansou model/response.go). `Results` is
+ *  tagged `json:"results,omitempty"`, so a search with ZERO hits serialises as
+ *  `{"code":0,"message":"success","data":{"total":0}}` — no `results` key at all
+ *  (verified live 2026-09-19 on the self-hosted container and so.252035.xyz).
+ *
+ *  Rule, in order:
+ *   1. a PRESENT `results` must be an array — a numeric `total` never excuses a
+ *      malformed one (an object would blow up `for...of` and be misread as
+ *      「源挂了」; a string would iterate silently and look like a healthy miss);
+ *      `null` counts as absent (encoding/json writes null for a nil slice on a
+ *      build without omitempty);
+ *   2. with `results` absent, a numeric `total` is the zero-hit signature;
+ *   3. anything else is not PanSou.
+ *
+ *  Exported so the settings-page save probe applies the SAME rule: the two
+ *  drifting apart is exactly how a probe could persist an address the provider
+ *  then cannot consume (Copilot, #259). */
+export function isPanSouSearchData(
+  data: unknown,
+): data is { results?: unknown[] | null; total?: number } {
+  if (!isRecord(data)) return false;
+  const results = data["results"];
+  if (results !== undefined && results !== null) {
+    return Array.isArray(results);
+  }
+  return typeof data["total"] === "number";
+}
+
 function isPanSouSuccessResponse(value: unknown): value is {
   code: 0;
   data: {
-    results: unknown[];
+    results?: unknown[] | null;
+    total?: number;
   };
 } {
-  if (!isRecord(value) || value["code"] !== 0 || !isRecord(value["data"])) {
+  if (!isRecord(value) || value["code"] !== 0) {
     return false;
   }
-  return Array.isArray(value["data"]["results"]);
+  // Treating the zero-hit shape as "not a PanSou payload" turned every honest
+  // miss into a false 「搜索源连不上」 alert (2026-09-07 → 09-19, daily patrol).
+  return isPanSouSearchData(value["data"]);
 }
 
 function collectLinkFacts(results: unknown[]): PanSouLinkFact[] {
@@ -264,6 +330,11 @@ function normalizeResourceType(rawType: string, url: string): ResourceType | nul
     /cloud\.189\.cn\/web\/share\?[^#]*\bcode=/.test(url)
   ) {
     return "tianyi";
+  }
+  // 光鸭 share: the SAME parser the executor transfers with, so a lookalike host
+  // (evilguangyapan.com) can never become a candidate that then fails as unsupported.
+  if (parseGuangYaShareUrl(url) !== null) {
+    return "guangya";
   }
   if (url.startsWith("magnet:")) {
     return "magnet";

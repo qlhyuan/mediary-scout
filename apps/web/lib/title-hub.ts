@@ -2,6 +2,7 @@ import {
   createTmdbMetadataProvider,
   getTrackedSeasonStatusView,
   isMovieUnreleased,
+  isUserVisibleWorkflowKind,
   prepareSeriesTarget,
   queueSeriesInitialization,
   queueTrackingInitialization,
@@ -18,6 +19,7 @@ import {
   type LibraryWallStateValue,
   type TitleAggregateState,
 } from "./title-aggregate";
+import { createTtlMemo } from "./series-target-memo";
 import { InMemoryJsonCache, PostgresMediaSearchCache, type DurableJsonCache } from "./tmdb-cache";
 import {
   ensureDemoSeeded,
@@ -80,14 +82,19 @@ export interface MovieHubView {
   /** acquired=已入库, reserved=未上映已预定, acquiring=获取中, missing=已上映未获取, untracked=未追踪. */
   state: "acquired" | "reserved" | "acquiring" | "missing" | "untracked";
   acquiring: boolean;
+  /** The film's file is in the library. Not the same as state "acquired": while a run
+   *  of the film is queued or running (a user's replace request keeps the old file)
+   *  the state reads 获取中. */
+  obtained: boolean;
 }
 
 export type DetailView = TitleHubView | MovieHubView;
 
 const SERIES_TARGET_TTL_MS = 6 * 60 * 60 * 1000;
-// L1: per-process in-memory cache (fast, but resets on every restart — which is
-// why a cold detail-page load paid a live TMDB round-trip every dev restart).
-const seriesTargetCache = new Map<number, { value: PreparedSeriesTarget; expiresAt: number }>();
+/** A miss (unknown id, or TMDB timed out) must not be retried on the refresh
+ *  that follows the load which just learned it. Short on purpose: a real
+ *  outage should not hide season metadata for the success TTL. */
+const SERIES_TARGET_MISS_TTL_MS = 60_000;
 // L2: durable Postgres cache, so the season list + artwork survive restarts and
 // the page renders from the DB instead of re-hitting TMDB on every cold load.
 let durableTargetCache: DurableJsonCache | null = null;
@@ -104,36 +111,58 @@ function getDurableTargetCache(): DurableJsonCache {
   return durableTargetCache;
 }
 
+/** Live TMDB read, then a best-effort durable write. A write failure is logged
+ *  and the prepared target is still returned, so the in-process memo can keep it. */
+export async function loadSeriesTargetWithCache(
+  tmdbId: number,
+  durable: DurableJsonCache,
+  fetchTarget: (tmdbId: number) => Promise<PreparedSeriesTarget | null>,
+): Promise<PreparedSeriesTarget | null> {
+  const fromDb = await durable.getJson<PreparedSeriesTarget>(`series-target:${tmdbId}`);
+  if (fromDb) return fromDb;
+  let value: PreparedSeriesTarget | null;
+  try {
+    value = await fetchTarget(tmdbId);
+  } catch {
+    return null;
+  }
+  try {
+    await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
+  } catch (error) {
+    console.error(
+      `[media-track] series-target cache write failed for ${tmdbId}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return value;
+}
+
+async function loadSeriesTarget(tmdbId: number): Promise<PreparedSeriesTarget | null> {
+  return loadSeriesTargetWithCache(tmdbId, getDurableTargetCache(), async (id) =>
+    prepareSeriesTarget({
+      tmdbId: id,
+      qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
+      metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
+    }),
+  );
+}
+
+const seriesTargetMemo = createTtlMemo<PreparedSeriesTarget>({
+  successTtlMs: SERIES_TARGET_TTL_MS,
+  failureTtlMs: SERIES_TARGET_MISS_TTL_MS,
+  load: loadSeriesTarget,
+});
+
 /**
  * Season metadata + artwork for a title, independent of tracking state.
- * Live TMDB when configured (cached 6h per title), demo candidates otherwise,
- * null when the title is unknown to both.
+ * Live TMDB when configured (cached 6h per title). A miss is remembered for a
+ * minute so refresh does not wait on it again. A refetch that fails keeps the
+ * last successful payload instead of blanking the season list. A durable-cache
+ * write failure does not discard a live result. Demo candidates otherwise;
+ * null when the title was never known.
  */
 async function seriesTargetFor(tmdbId: number): Promise<PreparedSeriesTarget | null> {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
-    const cached = seriesTargetCache.get(tmdbId);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.value;
-    }
-    const durable = getDurableTargetCache();
-    const fromDb = await durable.getJson<PreparedSeriesTarget>(`series-target:${tmdbId}`);
-    if (fromDb) {
-      // DB hit — warm L1 and skip the TMDB round-trip (this is the cold-load fix).
-      seriesTargetCache.set(tmdbId, { value: fromDb, expiresAt: Date.now() + SERIES_TARGET_TTL_MS });
-      return fromDb;
-    }
-    try {
-      const value = await prepareSeriesTarget({
-        tmdbId,
-        qualityPreference: process.env.MEDIA_TRACK_DEFAULT_QUALITY ?? "4K",
-        metadataProvider: createTmdbMetadataProvider(await getTmdbAccesses(getAccountScopedSettings(await getCurrentAccountId()))),
-      });
-      seriesTargetCache.set(tmdbId, { value, expiresAt: Date.now() + SERIES_TARGET_TTL_MS });
-      await durable.setJson(`series-target:${tmdbId}`, value, SERIES_TARGET_TTL_MS);
-      return value;
-    } catch {
-      return seriesTargetCache.get(tmdbId)?.value ?? null;
-    }
+    return seriesTargetMemo(tmdbId);
   }
 
   const candidate = findDemoCandidateByTmdbId(tmdbId);
@@ -243,7 +272,7 @@ export async function getTitleHubView(tmdbId: number, storageId?: string): Promi
   const airing = aggregateAiring(seasons);
 
   const acquiring = (await repository.listActiveWorkflowRuns(scope)).some(
-    (snapshot) => snapshot.title.tmdbId === tmdbId,
+    (snapshot) => snapshot.title.tmdbId === tmdbId && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
   );
 
   return {
@@ -281,12 +310,12 @@ export async function getDetailView(
   const movieState = trackedForTitle.find((state) => state.title.type === "movie");
   if (movieState) {
     const acquiring = (await repository.listActiveWorkflowRuns(scope)).some(
-      (snapshot) => snapshot.title.tmdbId === tmdbId,
+      (snapshot) => snapshot.title.tmdbId === tmdbId && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
     );
     const obtained = movieState.episodes.some((episode) => episode.obtained);
     const reserved = isMovieUnreleased(movieState.title.releaseDate, now);
     const state = acquiring ? "acquiring" : reserved ? "reserved" : obtained ? "acquired" : "missing";
-    return movieHubViewFromTitle(movieState.title, state, acquiring);
+    return movieHubViewFromTitle(movieState.title, state, acquiring, obtained);
   }
 
   // Untracked title: TMDB's movie/tv id namespaces collide (movie 278 ≠ tv 278).
@@ -299,7 +328,7 @@ export async function getDetailView(
       return null;
     }
     // Untracked stays untracked even if unreleased — `reserved` means tracked + waiting.
-    return movieHubViewFromTitle(movieTarget.title, "untracked", false);
+    return movieHubViewFromTitle(movieTarget.title, "untracked", false, false);
   };
 
   if (typeHint === "movie") {
@@ -323,6 +352,7 @@ function movieHubViewFromTitle(
   title: MediaTitle,
   state: MovieHubView["state"],
   acquiring: boolean,
+  obtained: boolean,
 ): MovieHubView {
   return {
     kind: "movie",
@@ -336,6 +366,7 @@ function movieHubViewFromTitle(
     releaseDate: title.releaseDate ?? null,
     state,
     acquiring,
+    obtained,
   };
 }
 
@@ -492,12 +523,17 @@ export interface InProgressTitle {
 /**
  * Titles with an acquisition run still queued/running — they surface in the
  * library as non-clickable "获取中" poster placeholders until the run finishes
- * and the title materializes as a real card.
+ * and the title materializes as a real card. A replace_request run is not one:
+ * its title is already in the library, and those runs queue last and pile up
+ * after each sweep — the card must still open the page, where the user edits or
+ * withdraws the message (design §1 G2).
  */
 export async function getInProgressTitles(storageId?: string): Promise<InProgressTitle[]> {
   const repository = getWorkflowRepository();
   const scope = await getActiveWorkspaceScope(storageId);
-  const active = await repository.listActiveWorkflowRuns(scope);
+  const active = (await repository.listActiveWorkflowRuns(scope)).filter(
+    (snapshot) => snapshot.workflowRun.kind !== "replace_request" && isUserVisibleWorkflowKind(snapshot.workflowRun.kind),
+  );
   const byTmdb = new Map<number, InProgressTitle>();
   for (const snapshot of active) {
     const title = snapshot.title;

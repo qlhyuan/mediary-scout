@@ -1,4 +1,5 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { isAgentMemoryEnabled } from "./agent-memory-server";
 import { cache } from "react";
 import {
   checkLoginAllowed,
@@ -12,6 +13,9 @@ import {
   createBootstrapPan115CookieStorageExecutor,
   CompositeResourceProvider,
   ProwlarrResourceProvider,
+  createJevJudge,
+  DEFAULT_JEV_BASE_URL,
+  type JevJudge,
   createTmdbMetadataProvider,
   TMDB_DIRECT_BASE_URL,
   type TmdbAccess,
@@ -24,6 +28,7 @@ import {
   createStubAcquisitionModel,
   llmConfigError,
   formatDailyDigestPushText,
+  scheduledDigestItems,
   getTrackedSeasonStatusView,
   importForeignWorkAsMovie,
   assertWorkflowAgentAdapterPolicy,
@@ -34,11 +39,15 @@ import {
   queueSeriesInitialization,
   queueTrackingInitialization,
   reserveMovie,
+  enqueueUrgentReplaceRequests,
   runQueuedMovieAcquisition,
+  runQueuedReplaceRequest,
+  runQueuedStagingRecovery,
   runQueuedSeriesInitialization,
   runQueuedType2Workflow,
   resolveDriveSourceLabels,
   runScheduledType3Monitoring,
+  sweepOrphanStagingDirs,
   sendPushNotifications,
   createPostgresWorkflowRepositorySync,
   createSqliteWorkflowRepository,
@@ -55,6 +64,8 @@ import {
   parsePan123Uid,
   generateGuangYaDeviceId,
   GuangYaClient,
+  isRunOrItsSeasonRecord,
+  type QueueClaimOptions,
   type ResolveAccountWorkerContext,
   hashPassword,
   verifyPassword,
@@ -75,6 +86,7 @@ import {
   type ResourceProvider,
   type ResourceType,
   type SeasonMetadataSync,
+  type StagingJanitorDrive,
   type StorageExecutor,
   type TianyiSession,
   type TianyiQrSession,
@@ -92,6 +104,18 @@ import { findDemoCandidateById, findDemoCandidateByTmdbId } from "./demo-candida
 import { seedDemoWorkflowRepository } from "./demo-workflow";
 import { resolveRegistration, deriveBootstrapState, canManageAccounts } from "./account-bootstrap";
 import { isDemoMode } from "./demo-mode";
+import { isUpdateHoldActive, whileInFlight } from "./update-hold";
+import { DEFAULT_AUTO_UPDATE_TIME, isAutoUpdateTime, shouldAutoUpdate } from "./auto-update-schedule";
+
+/** Checked by the workflow package right before each claim or patrol reservation, not
+ *  only at entry: the updater can take the hold while a tick is still setting up. */
+const mayStartRun = () => !isUpdateHoldActive(Date.now());
+
+/** True while the updater holds new work before a container swap. Lets server actions
+ *  (e.g. importForeignWorkAction) refuse upfront without importing update-hold directly. */
+export function isUpdateInProgress(): boolean {
+  return isUpdateHoldActive(Date.now());
+}
 
 export type CandidateTrackingRequestResult =
   | {
@@ -477,6 +501,16 @@ export class UnauthenticatedAccountError extends Error {
   }
 }
 
+/** Thrown when a drive mutation is refused because an update is about to swap the web
+ *  container. Rechecked INSIDE the in-flight guard so the updater's busy check cannot miss
+ *  it: the caller turns it into a "try again after the update" message. */
+export class UpdateInProgressError extends Error {
+  constructor(message = "正在更新，更新完成后再试。") {
+    super(message);
+    this.name = "UpdateInProgressError";
+  }
+}
+
 let sessionSecretCache: string | null = null;
 
 /** The HMAC secret for session cookies: env override, else a generated value
@@ -536,8 +570,14 @@ export async function resolveSessionAccountId(signedCookie: string): Promise<str
  * has no per-key account_settings, so it reads exactly the global values it
  * always did — single-user behavior is unchanged.
  */
-export function getAccountScopedSettings(accountId: string): { getSetting(key: string): Promise<string | null> } {
-  const repository = getWorkflowRepository();
+export function getAccountScopedSettings(
+  accountId: string,
+  /** Injectable for callers that already hold the repository (a server action
+   *  that also writes through it, a test with a swapped repo). Defaults to the
+   *  process-wide one, so every existing call site is unchanged. */
+  repo?: Pick<WorkflowRepository, "getAccountSetting" | "getSetting">,
+): { getSetting(key: string): Promise<string | null>; getOwnSetting(key: string): Promise<string | null> } {
+  const repository = repo ?? getWorkflowRepository();
   return {
     async getSetting(key: string): Promise<string | null> {
       const own = await repository.getAccountSetting(accountId, key);
@@ -545,6 +585,12 @@ export function getAccountScopedSettings(accountId: string): { getSetting(key: s
         return own;
       }
       return repository.getSetting(key);
+    },
+    // The account's own row only, no fallback: for the few readers that must know
+    // WHERE a value came from (getJevConfig: a URL the account chose may not carry a
+    // key the account borrowed from the instance).
+    async getOwnSetting(key: string): Promise<string | null> {
+      return repository.getAccountSetting(accountId, key);
     },
   };
 }
@@ -784,7 +830,7 @@ export async function queueCandidateTracking(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   const movieTmdbId = parseMovieCandidateId(candidateId);
   if (movieTmdbId !== null) {
@@ -881,7 +927,7 @@ export async function runStartupMigrations(): Promise<void> {
  * shared one. model/resourceProvider/language stay global (shared author LLM/
  * PanSou) for v1 — per-account LLM/Prowlarr is a later refinement.
  */
-function buildAccountContextResolver(): ResolveAccountWorkerContext {
+export function buildAccountContextResolver(): ResolveAccountWorkerContext {
   return async (accountId: string, connectedStorageId?: string | null) => {
     // Per-account settings (account_settings → global → env) drive the agent
     // model, resource providers, language and quality — so each user's
@@ -897,12 +943,25 @@ function buildAccountContextResolver(): ResolveAccountWorkerContext {
     const driveProvider =
       (await getAccountStorageCredentials(accountId, connectedStorageId))?.provider ?? "pan115";
     const assrtToken = await getAssrtToken(scoped);
+    // Per-account: undefined unless THIS account set a key, enabled the prefilter
+    // and the save-time probe passed. Undefined → the orchestrator keeps the bare
+    // provider, so an unconfigured account costs exactly zero Jev calls.
+    const jevJudge = await resolveJevJudge(scoped);
+    // Agent memory is on unless THIS account switched it off (Settings → AI 模型).
+    // Best-effort like every memory step: a failing read must not fail a runnable job —
+    // fall back to the default (on); the orchestrator swallows later store failures.
+    const agentMemory = await isAgentMemoryEnabled(getWorkflowRepository(), accountId).catch((error: unknown) => {
+      console.log(`[memory] agent_memory_enabled read failed (defaulting on): ${error instanceof Error ? error.message : String(error)}`);
+      return true;
+    });
     return {
       storage: await getWorkerStorageExecutor(accountId, connectedStorageId),
       resourceProvider: await getWorkerResourceProvider(scoped, driveProvider, accountId),
       storageProvider: driveProvider,
       model,
       ...(assrtToken === undefined ? {} : { assrtToken }),
+      ...(jevJudge === undefined ? {} : { jevJudge }),
+      agentMemory,
       ...(preferredLanguage === undefined ? {} : { preferredLanguage }),
       ...(qualityPreference === undefined ? {} : { qualityPreference }),
       storageParentDirectoryId: parents.tv,
@@ -945,7 +1004,20 @@ export function __resetPanSouHealthCacheForTests(): void {
   lastRecordedPanSouHealth.clear();
 }
 
-export async function runNextQueuedWorkflow() {
+/** Claim and run the next queued run. The in-process worker passes `claim` (its drive
+ *  filter and claim callback) so several runs can go at once, never two on one drive;
+ *  without it the oldest claimable run is taken, as before. */
+export async function runNextQueuedWorkflow(claim?: QueueClaimOptions) {
+  // An update is about to replace this process: start nothing new. Queued runs stay
+  // queued and run on the new version.
+  if (isUpdateHoldActive(Date.now())) {
+    return { status: "idle" as const };
+  }
+  // In flight for the updater's busy check, from here to the claim it guards.
+  return whileInFlight(() => runNextQueuedWorkflowNow(claim));
+}
+
+async function runNextQueuedWorkflowNow(claim: QueueClaimOptions | undefined) {
   const repository = getWorkflowRepository();
   // §7 form B: the worker resolves each CLAIMED run's account credentials via
   // resolveAccountContext (claim-first), so bob's acquisition lands in bob's 115.
@@ -964,6 +1036,14 @@ export async function runNextQueuedWorkflow() {
   const resolveAccountContext = buildAccountContextResolver();
   const startedAt = new Date().toISOString();
   const onAuthErrorFreeze = (id: string, reason: string) => freezeConnectedStorage(id, reason);
+  const claimOption = claim === undefined ? {} : { claim };
+  // Urgent user messages ("现在处理", written mid-run, or retry after a failure) get a
+  // replace_request as soon as the queue is free — never waiting for the patrol.
+  try {
+    await enqueueUrgentReplaceRequests({ repository });
+  } catch (error) {
+    console.error(`[user-message] urgent scan failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const type2 = await runQueuedType2Workflow({
     repository,
     resourceProvider: await getWorkerResourceProvider(),
@@ -975,9 +1055,11 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (type2.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: type2.workflowRunId });
     return type2;
   }
   const series = await runQueuedSeriesInitialization({
@@ -991,9 +1073,11 @@ export async function runNextQueuedWorkflow() {
     animeStorageParentDirectoryId: parents.anime,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (series.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: series.workflowRunId });
     return series;
   }
   const movie = await runQueuedMovieAcquisition({
@@ -1006,11 +1090,47 @@ export async function runNextQueuedWorkflow() {
     moviesParentDirectoryId: parents.movies,
     resolveAccountContext,
     onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
   });
   if (movie.status !== "idle") {
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: movie.workflowRunId });
+    return movie;
   }
-  return movie;
+  const replace = await runQueuedReplaceRequest({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    storageParentDirectoryId: parents.tv,
+    animeStorageParentDirectoryId: parents.anime,
+    moviesParentDirectoryId: parents.movies,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
+    // A work with 待换 episodes skips the patrol, where TMDB sync normally happens.
+    ...syncOption(),
+  });
+  if (replace.status !== "idle") {
+    await pushNotificationsSince(repository, startedAt, { workflowRunId: replace.workflowRunId });
+    return replace;
+  }
+  // Leftover staging heals itself. No notification and no push.
+  return runQueuedStagingRecovery({
+    repository,
+    resourceProvider: await getWorkerResourceProvider(),
+    storage,
+    model,
+    ...language,
+    ...quality,
+    resolveAccountContext,
+    onAuthErrorFreeze,
+    mayStartRun,
+    ...claimOption,
+  });
 }
 
 /** The user's preferred subtitle language for acquisition search, or undefined
@@ -1168,6 +1288,128 @@ export async function getProwlarrConfig(
   };
 }
 
+export const JEV_API_KEY_SETTING_KEY = "jev_api_key";
+export const JEV_BASE_URL_SETTING_KEY = "jev_base_url";
+export const JEV_PREFILTER_ENABLED_SETTING_KEY = "jev_prefilter_enabled";
+/** "ok" after a successful save-time probe; anything else (absent/blank) = inactive.
+ *  A failed probe refuses the save and leaves the previous state untouched, so
+ *  "fail" is never written; runtime failures fail open per search (see
+ *  SnapshotPrefilter.status) and are not recorded here (future: health badge). */
+export const JEV_HEALTH_SETTING_KEY = "jev_health";
+/** The model name the save-time probe answered with (e.g. "jev-1.13.0" direct,
+ *  "typesafe/jev-1.13-20260917" via OpenRouter). Display only — the settings page
+ *  shows it as a pill next to 生效中. Blank/absent → no pill; never invented. */
+export const JEV_MODEL_SETTING_KEY = "jev_model";
+
+/** Which (key, base URL) the "ok" above was probed with — see jevConfigFingerprint.
+ *  Written together with health by 保存并测试, blanked by 清除. */
+export const JEV_PROBED_FOR_SETTING_KEY = "jev_probed_for";
+
+/** A short one-way fingerprint of the probed config. The raw key never goes into it
+ *  in a recoverable form; 64 bits is plenty to notice a rotation. */
+export function jevConfigFingerprint(apiKey: string, baseUrl: string): string {
+  return createHash("sha256").update(`${apiKey.trim()}\n${baseUrl.trim()}`).digest("hex").slice(0, 16);
+}
+
+/** Where Jev settings are read from: a plain repository, or the account → global
+ *  facade (getAccountScopedSettings), whose getOwnSetting tells the account's own rows
+ *  apart from what it inherits. */
+export interface JevSettingsSource {
+  getSetting(key: string): Promise<string | null>;
+  getOwnSetting?(key: string): Promise<string | null>;
+}
+
+export interface JevConfig {
+  apiKey: string | undefined;
+  baseUrl: string;
+  enabled: boolean;
+  health: string | undefined;
+}
+
+/** Jev candidate prefilter settings (Settings → AI 模型). DB wins over env;
+ *  blank = unset. `enabled` is true only for the exact string "1".
+ *  env JEV_API_KEY / JEV_BASE_URL only supply the key/url; activation still
+ *  requires a successful 保存并测试 (which writes enabled/health) — an env-only
+ *  deployment activates by saving the form with the key left blank. */
+export async function getJevConfig(
+  repository: JevSettingsSource,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<JevConfig> {
+  const read = async (key: string, envKey: string): Promise<string | undefined> => {
+    const dbValue = (await repository.getSetting(key))?.trim();
+    if (dbValue) return dbValue;
+    const envValue = env[envKey]?.trim();
+    return envValue ? envValue : undefined;
+  };
+  const apiKey = await read(JEV_API_KEY_SETTING_KEY, "JEV_API_KEY");
+  const baseUrl = (await read(JEV_BASE_URL_SETTING_KEY, "JEV_BASE_URL")) ?? DEFAULT_JEV_BASE_URL;
+  const health = (await repository.getSetting(JEV_HEALTH_SETTING_KEY))?.trim() || undefined;
+  // A verdict only covers the config it was probed with. When the effective key or URL
+  // has moved since (an env JEV_API_KEY rotated, an operator changed the global URL),
+  // "ok" would keep the prefilter "active" while every real search fails open without
+  // a word — so it reads as untested until the next 保存并测试. Rows saved before the
+  // fingerprint existed carry none and keep their verdict: an upgrade must not switch
+  // the prefilter off silently.
+  const probedFor = (await repository.getSetting(JEV_PROBED_FOR_SETTING_KEY))?.trim();
+  const stale = Boolean(probedFor) && probedFor !== jevConfigFingerprint(apiKey ?? "", baseUrl);
+  // A URL the account chose carries the account's OWN key or nothing. With the key
+  // inherited from the instance (global row or env), an account-level URL would send
+  // the shared key to a host of the account's choosing on every search (multi-user);
+  // it reads as untested instead, so no call is ever made. 保存并测试 refuses to
+  // create this state; this covers rows it did not write.
+  const ownUrl = (await repository.getOwnSetting?.(JEV_BASE_URL_SETTING_KEY))?.trim();
+  const ownKey = (await repository.getOwnSetting?.(JEV_API_KEY_SETTING_KEY))?.trim();
+  const borrowedKeyAtOwnUrl = Boolean(ownUrl) && !ownKey;
+  return {
+    apiKey,
+    baseUrl,
+    enabled: ((await repository.getSetting(JEV_PREFILTER_ENABLED_SETTING_KEY))?.trim() ?? "") === "1",
+    health: stale || borrowedKeyAtOwnUrl ? undefined : health,
+  };
+}
+
+/** The account's OWN Jev base-URL override, for the settings input. Deliberately NOT
+ *  read through the account → global facade: prefilling a global (or env) value would
+ *  be saved straight back into the account row on the next 保存, freezing today's
+ *  endpoint and shadowing later operator / env changes. Blank = no override. */
+export async function getJevBaseUrlOverride(
+  accountId: string,
+  repo: Pick<WorkflowRepository, "getAccountSetting"> = getWorkflowRepository(),
+): Promise<string> {
+  return (await repo.getAccountSetting(accountId, JEV_BASE_URL_SETTING_KEY))?.trim() ?? "";
+}
+
+/** Where a BLANK account Base URL resolves: the instance-wide (global) row → env
+ *  JEV_BASE_URL → the OpenRouter default. 保存并测试 probes this when the field is left
+ *  blank, and the settings input shows it as the placeholder — one rule, so the page
+ *  can never promise an endpoint other than the one that will be called. */
+export async function getJevInheritedBaseUrl(
+  repo: Pick<WorkflowRepository, "getSetting"> = getWorkflowRepository(),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string> {
+  const global = (await repo.getSetting(JEV_BASE_URL_SETTING_KEY))?.trim();
+  if (global) return global;
+  return env.JEV_BASE_URL?.trim() || DEFAULT_JEV_BASE_URL;
+}
+
+/** The go/no-go, on an already-read config: key set AND enabled AND the last
+ *  probe succeeded. The settings page and resolveJevJudge share this one rule. */
+export function isJevPrefilterActive(cfg: JevConfig): boolean {
+  return Boolean(cfg.apiKey) && cfg.enabled && cfg.health === "ok";
+}
+
+/** The ONE place that decides whether the prefilter is active. Anything short of
+ *  key + enabled + healthy → undefined → the orchestrator uses the bare provider
+ *  (zero Jev calls, zero prompt change). */
+export async function resolveJevJudge(
+  repository: JevSettingsSource,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<JevJudge | undefined> {
+  const cfg = await getJevConfig(repository, env);
+  if (!isJevPrefilterActive(cfg) || !cfg.apiKey) return undefined;
+  return createJevJudge({ apiKey: cfg.apiKey, baseUrl: cfg.baseUrl });
+}
+
 export const DAILY_SWEEP_TIME_SETTING_KEY = "daily_sweep_time";
 /** Default daily 巡检 time (Beijing) when the user hasn't configured one. */
 export const DEFAULT_DAILY_SWEEP_TIME = "06:00";
@@ -1187,6 +1429,23 @@ export const DAILY_SWEEP_TIMES_SETTING_KEY = "daily_sweep_times";
 export const MAX_DAILY_SWEEP_TIMES = 6;
 
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+export const PATROL_CONCURRENCY_SETTING_KEY = "patrol_max_concurrent_runs";
+export const DEFAULT_PATROL_CONCURRENCY = 1;
+export const MAX_PATROL_CONCURRENCY = 5;
+
+/** 同时处理几部作品（1~5，默认 1 = 逐部），巡检和手动获取共用。同一块网盘上的作品始终逐部跑。 */
+export async function getPatrolConcurrency(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<number> {
+  const value = Number((await repository.getSetting(PATROL_CONCURRENCY_SETTING_KEY))?.trim());
+  return Number.isInteger(value) && value >= 1 && value <= MAX_PATROL_CONCURRENCY ? value : DEFAULT_PATROL_CONCURRENCY;
+}
+
+/** The in-process worker's limit on queued runs going at once (same setting as the patrol). */
+export async function getWorkerConcurrency(): Promise<number> {
+  return getPatrolConcurrency(getWorkflowRepository());
+}
 
 /**
  * 巡检时间点列表（北京 "HH:MM"，升序去重，1~6 个）。读取顺序：
@@ -1283,7 +1542,7 @@ export async function reserveCandidate(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再预定。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "预定") };
   }
   const request = await reserveMovie({
     title: movie.title,
@@ -1302,6 +1561,12 @@ export async function reserveCandidate(
 async function pushNotificationsSince(
   targetRepository: WorkflowRepository,
   sinceIso: string,
+  /** The sweep always sends its digest; a queue drain (a patrol-queued replace run)
+   *  skips one that would only say nothing changed (see scheduledDigestItems).
+   *  `workflowRunId`: push only that run's notifications (its own record or its
+   *  per-season ones). A queued run passes its own id, since other runs going beside
+   *  it write notifications in the same window and each pushes its own when it finishes. */
+  opts: { sweep?: boolean; workflowRunId?: string } = {},
 ): Promise<void> {
   try {
     // Cross-account: the drain/sweep may have completed runs for several accounts.
@@ -1310,10 +1575,15 @@ async function pushNotificationsSince(
     // since is applied in the repository BEFORE the limit so a large sweep's
     // earliest notifications are not crowded out by newer already_current noise.
     // Cap is high enough for a full patrol of a large library; still bounded.
-    const recent = await targetRepository.listRecentNotificationsWithAccount({
-      since: sinceIso,
-      limit: 10_000,
-    });
+    const recent = (
+      await targetRepository.listRecentNotificationsWithAccount({
+        since: sinceIso,
+        limit: 10_000,
+      })
+    ).filter(
+      (entry) =>
+        opts.workflowRunId === undefined || isRunOrItsSeasonRecord(entry.notification.workflowRunId, opts.workflowRunId),
+    );
     if (recent.length === 0) {
       return;
     }
@@ -1337,7 +1607,7 @@ async function pushNotificationsSince(
       const notifications = entries.map((entry) => entry.notification);
       // A scheduled sweep touches many shows; collapse this account's into ONE
       // digest. User-triggered events stay per-resource — each its own message.
-      const scheduled = notifications.filter((notification) => notification.trigger === "scheduled");
+      const scheduled = scheduledDigestItems(notifications, { skipIfOnlyRoutine: opts.sweep !== true });
       const individual = notifications.filter((notification) => notification.trigger !== "scheduled");
 
       for (const notification of individual) {
@@ -1397,7 +1667,7 @@ export async function queueCandidateSeries(
     return { status: "unsupported", message: "网盘工作区不可用（未找到或暂时无法访问），请刷新后重试。" };
   }
   if (workspace.frozen) {
-    return { status: "unsupported", message: "该网盘已掉线，请重新扫码绑定同一个 115 后再获取。" };
+    return { status: "unsupported", message: frozenDriveMessage(workspace.provider, "获取") };
   }
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER === "tmdb") {
     const target = await prepareSeriesTarget({
@@ -1505,6 +1775,102 @@ export function beijingDateTime(): { date: string; hhmm: string } {
   return { date: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
 }
 
+export const AUTO_UPDATE_ENABLED_SETTING_KEY = "auto_update_enabled";
+export const AUTO_UPDATE_TIME_SETTING_KEY = "auto_update_time";
+const AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY = "auto_update_last_attempt";
+export const AUTO_UPDATE_FAIL_STREAK_SETTING_KEY = "auto_update_fail_streak";
+
+/** The auto-update switch and its hour (Beijing time). Off unless explicitly turned on;
+ *  a missing or malformed hour (anything but a whole hour) reads as the 04:00 default. */
+export async function getAutoUpdateSettings(
+  repository: { getSetting(key: string): Promise<string | null> },
+): Promise<{ enabled: boolean; time: string }> {
+  return { enabled: await isAutoUpdateEnabled(repository), time: await getAutoUpdateTime(repository) };
+}
+
+async function isAutoUpdateEnabled(repository: { getSetting(key: string): Promise<string | null> }): Promise<boolean> {
+  return (await repository.getSetting(AUTO_UPDATE_ENABLED_SETTING_KEY))?.trim() === "1";
+}
+
+async function getAutoUpdateTime(repository: { getSetting(key: string): Promise<string | null> }): Promise<string> {
+  const time = (await repository.getSetting(AUTO_UPDATE_TIME_SETTING_KEY))?.trim();
+  return time && isAutoUpdateTime(time) ? time : DEFAULT_AUTO_UPDATE_TIME;
+}
+
+/** Failed attempts at one release. `at` is when the last counted attempt ended: one failed
+ *  attempt is counted once, however many days its status stays on the updater. */
+interface AutoUpdateFailStreak {
+  tag: string;
+  count: number;
+  at: string;
+}
+
+function parseAutoUpdateFailStreak(raw: string | null): AutoUpdateFailStreak | null {
+  if (!raw?.trim()) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<AutoUpdateFailStreak> | null;
+    if (
+      parsed &&
+      typeof parsed.tag === "string" &&
+      typeof parsed.count === "number" &&
+      Number.isInteger(parsed.count) &&
+      parsed.count > 0
+    ) {
+      return { tag: parsed.tag, count: parsed.count, at: typeof parsed.at === "string" ? parsed.at : "" };
+    }
+  } catch {
+    // A hand-edited or damaged value counts as no failures.
+  }
+  return null;
+}
+
+/** Daily auto-update. The worker calls this every tick (3 s): with the switch off it reads
+ *  one setting and returns, and it looks at GitHub and the updater once a day, after the
+ *  set hour. The day is used up whatever the outcome (no update, offline, a state that says
+ *  wait): the next look is tomorrow. */
+export async function runAutoUpdateIfDue(): Promise<void> {
+  if (isDemoMode() || resolveIsDesktop()) return;
+  const repository = getWorkflowRepository();
+  // Off by default and asked every tick: read the switch alone first.
+  if (!(await isAutoUpdateEnabled(repository))) return;
+  const time = await getAutoUpdateTime(repository);
+  const { date, hhmm } = beijingDateTime();
+  const lastAttemptDate = (await repository.getSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY))?.trim() ?? null;
+  if (hhmm < time || lastAttemptDate === date) return;
+  await repository.setSetting(AUTO_UPDATE_LAST_ATTEMPT_SETTING_KEY, date);
+  // Dynamic: update-view-server imports this module.
+  const { loadUpdateView } = await import("./update-view-server");
+  const { requestUpdate } = await import("./updater-client");
+  const view = await loadUpdateView();
+  if (!view.updater || !view.available) return;
+  const tag = view.available.tag;
+  let failStreak = parseAutoUpdateFailStreak(await repository.getSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY));
+  // The last attempt at this same release failed: count it (once) before deciding.
+  if (view.updater.targetTag === tag && (view.updater.phase === "rolled_back" || view.updater.phase === "failed")) {
+    const at = view.updater.finishedAt ?? view.updater.startedAt ?? "";
+    if (!failStreak || failStreak.tag !== tag) {
+      failStreak = { tag, count: 1, at };
+    } else if (failStreak.at !== at) {
+      failStreak = { tag, count: failStreak.count + 1, at };
+    }
+    await repository.setSetting(AUTO_UPDATE_FAIL_STREAK_SETTING_KEY, JSON.stringify(failStreak));
+  }
+  const due = shouldAutoUpdate({
+    enabled: true,
+    time,
+    now: { date, hhmm },
+    lastAttemptDate,
+    available: tag,
+    failStreak,
+    updater: view.updater,
+    updateHoldActive: isUpdateHoldActive(Date.now()),
+  });
+  if (!due) return;
+  const result = await requestUpdate(tag);
+  if (result.ok) console.log(`[auto-update] started ${tag}`);
+  else console.warn(`[auto-update] ${tag} not started: ${result.reason}`);
+}
+
 /**
  * 每日巡检（per-slot 认领 + 合并补跑）。任何触发源（worker tick / cron / 手动）都
  * 打这里：每次找出「已到点且今天未认领」的时间点，一次性全部认领并只跑一次 sweep
@@ -1512,13 +1878,24 @@ export function beijingDateTime(): { date: string; hhmm: string } {
  * 容器同一语义（原 ignoreTimeGate 特例已退役）。`force` 跑完整 sweep 但不认领任何
  * slot（run-now 不得吞掉计划任务）。
  */
-export async function runScheduledType3(options?: {
-  force?: boolean;
-}): Promise<{
+type ScheduledType3Result = {
   outcomes: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
-  skipped?: "already_swept_today" | "before_scheduled_time";
+  skipped?: "already_swept_today" | "before_scheduled_time" | "update_in_progress";
   scheduledFor?: string;
-}> {
+};
+
+export async function runScheduledType3(options?: { force?: boolean }): Promise<ScheduledType3Result> {
+  // Checked before any slot is claimed, so a scheduled patrol skipped here still runs
+  // on the new version once the update is done.
+  if (isUpdateHoldActive(Date.now())) {
+    return { skipped: "update_in_progress", outcomes: [] };
+  }
+  // In flight for the updater's busy check: reservations and staging cleanup must not
+  // be cut by a swap. The manual 立即巡检 and cron routes come through here too.
+  return whileInFlight(() => runScheduledType3Now(options));
+}
+
+async function runScheduledType3Now(options?: { force?: boolean }): Promise<ScheduledType3Result> {
   const repository = getWorkflowRepository();
   let claimedNow: string[] = [];
   let priorClaims: string[] = [];
@@ -1564,6 +1941,9 @@ export async function runScheduledType3(options?: {
     );
   }
   let result: Awaited<ReturnType<typeof runScheduledType3Monitoring>>;
+  // Set when an update hold stopped a show from being reserved mid-sweep: the sweep is
+  // then not complete, and its slots must stay open for the new version.
+  let heldBack = false;
   try {
     await hydratePan115CookieFromDb();
     const sync = tmdbSeasonMetadataSync();
@@ -1581,12 +1961,48 @@ export async function runScheduledType3(options?: {
       animeStorageParentDirectoryId: parents.anime,
       moviesParentDirectoryId: parents.movies,
       staleActiveRunTimeoutMs: 30 * 60 * 1000,
+      maxConcurrentRuns: await getPatrolConcurrency(repository),
+      resolveDriveId: defaultDriveIdOf,
       resolveAccountContext: buildAccountContextResolver(),
       onAuthErrorFreeze: (id, reason) => freezeConnectedStorage(id, reason),
+      mayStartRun: () => {
+        const allowed = mayStartRun();
+        if (!allowed) heldBack = true;
+        return allowed;
+      },
       ...(sync ? { syncSeasonMetadata: sync } : {}),
     });
+    // Release this call's slots (as on a failure) and do not stamp a completed sweep,
+    // so the new version patrols the rest today. Seasons that did run are only re-checked.
+    const stopForUpdate = async () => {
+      if (claimedNow.length > 0) {
+        await repository.setSetting(
+          LAST_SWEEP_CLAIMS_SETTING_KEY,
+          JSON.stringify({ date: claimDate, slots: priorClaims }),
+        );
+      }
+      await pushNotificationsSince(repository, startedAt, { sweep: true });
+      return { skipped: "update_in_progress" as const, outcomes: result };
+    };
+    if (heldBack) return await stopForUpdate();
+    try {
+      const janitor = await sweepOrphanStagingDirs({
+        repository,
+        drives: await stagingJanitorDrives(),
+        now: new Date().toISOString(),
+        mayStartRun,
+      });
+      if (janitor.held) heldBack = true;
+    } catch (error) {
+      console.error(
+        `[patrol] staging janitor failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // The janitor stopped for an update, or the hold started after both had passed their
+    // checks: either way the new version should run today's sweep, so do not mark it done.
+    if (heldBack || !mayStartRun()) return await stopForUpdate();
     await repository.setSetting(LAST_SWEEP_COMPLETED_AT_SETTING_KEY, new Date().toISOString());
-    await pushNotificationsSince(repository, startedAt);
+    await pushNotificationsSince(repository, startedAt, { sweep: true });
     return { outcomes: result };
   } catch (error) {
     // The sweep failed before completing — release THIS call's claims (keep the
@@ -1613,6 +2029,11 @@ export async function runScheduledType3(options?: {
  * after tracking began. Returns undefined when TMDB isn't configured, leaving
  * the sweep on stored counts.
  */
+function syncOption(): { syncSeasonMetadata?: SeasonMetadataSync } {
+  const sync = tmdbSeasonMetadataSync();
+  return sync ? { syncSeasonMetadata: sync } : {};
+}
+
 function tmdbSeasonMetadataSync(): SeasonMetadataSync | undefined {
   if (process.env.MEDIA_TRACK_SEARCH_PROVIDER !== "tmdb") {
     return undefined;
@@ -1630,6 +2051,46 @@ function tmdbSeasonMetadataSync(): SeasonMetadataSync | undefined {
       totalEpisodes: target.season.totalEpisodes,
     };
   };
+}
+
+/** One fresh executor per connected drive. Frozen drives are handed over with an
+ *  empty executor — the janitor skips them before any call. A drive whose
+ *  executor cannot be built is omitted; the rest of the patrol still runs. */
+async function stagingJanitorDrives(): Promise<StagingJanitorDrive[]> {
+  const repository = getWorkflowRepository();
+  const drives: StagingJanitorDrive[] = [];
+  for (const account of await repository.listAccounts()) {
+    for (const storage of await repository.listConnectedStorages(account.id)) {
+      if (storage.status !== "active") {
+        drives.push({
+          accountId: account.id,
+          storageId: storage.id,
+          status: storage.status,
+          provider: storage.provider,
+          tvCid: storage.tvCid,
+          animeCid: storage.animeCid,
+          executor: {},
+        });
+        continue;
+      }
+      try {
+        drives.push({
+          accountId: account.id,
+          storageId: storage.id,
+          status: storage.status,
+          provider: storage.provider,
+          tvCid: storage.tvCid,
+          animeCid: storage.animeCid,
+          executor: await getWorkerStorageExecutor(account.id, storage.id),
+        });
+      } catch (error) {
+        console.error(
+          `[patrol] staging janitor: executor for ${storage.id} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+  return drives;
 }
 
 async function seedDemoIfEmpty(targetRepository: WorkflowRepository): Promise<void> {
@@ -1740,7 +2201,7 @@ async function getWorkerResourceProvider(
     const kinds: readonly string[] = isRegisteredStorageProvider(provider)
       ? getStorageBrand(provider).resourceProviderKinds
       : ["pansou-115", "prowlarr"];
-    // 夸克 → quark-only links; 光鸭(磁力) → magnet-only; 115 → 115 + magnet.
+    // 夸克 → quark-only links; 光鸭 → guangya + magnet; 115 → 115 + magnet.
     const allowedTypes: ResourceType[] = allowedResourceTypesForKinds(kinds);
     const providers: Array<{ name: string; provider: ResourceProvider }> = [
       {
@@ -1950,6 +2411,14 @@ function makeTokenPersister(
   };
 }
 
+/** The drive an unbound run of this account lands on — the same pick as
+ *  getAccountStorageCredentials(accountId, null), without its credential checks
+ *  or directory provisioning. Used only as the patrol's per-drive key. */
+async function defaultDriveIdOf(accountId: string): Promise<string | null> {
+  const storages = await getWorkflowRepository().listConnectedStorages(accountId);
+  return storages.find((storage) => isRegisteredStorageProvider(storage.provider))?.id ?? null;
+}
+
 async function getAccountStorageCredentials(
   accountId: string,
   connectedStorageId?: string | null,
@@ -2037,17 +2506,24 @@ async function getAccountStorageCredentials(
 async function resolveQueueStorage(
   accountId: string,
   explicitConnectedStorageId?: string | null,
-): Promise<{ id: string | null; frozen: boolean; unknown: boolean }> {
+): Promise<{ id: string | null; frozen: boolean; unknown: boolean; provider: string | null }> {
   try {
     const storages = (await getWorkflowRepository().listConnectedStorages(accountId)).filter(
       (storage) => isRegisteredStorageProvider(storage.provider),
     );
-    return resolveQueueStorageChoice(storages, explicitConnectedStorageId);
+    const choice = resolveQueueStorageChoice(storages, explicitConnectedStorageId);
+    return { ...choice, provider: storages.find((storage) => storage.id === choice.id)?.provider ?? null };
   } catch {
     // Fail closed: transient DB errors must not queue unscoped or drop an
     // explicit workspace pin (would land on the wrong drive).
-    return { id: null, frozen: false, unknown: true };
+    return { id: null, frozen: false, unknown: true, provider: null };
   }
+}
+
+/** Refusal for a queue/reserve action on a drive whose login died: re-scan THAT brand. */
+function frozenDriveMessage(provider: string | null, action: "获取" | "预定"): string {
+  const label = provider ? getStorageBrand(provider).label : "网盘";
+  return `该网盘已掉线，请重新扫码绑定同一个${label}后再${action}。`;
 }
 
 /** Marks a drive frozen — its cookie died. Called when a worker/probe hits a
@@ -2450,17 +2926,27 @@ export async function importForeignWorkFiles(input: {
   movieTitle: string;
   year: number;
 }): Promise<{ movieDirectoryId: string; movedFileIds: string[] }> {
-  // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
-  // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
-  // `{tmdb-N}` only when a caller passes tmdbId.
-  const accountId = await getCurrentAccountId();
-  const parents = await getWorkerStorageParents(accountId);
-  return importForeignWorkAsMovie({
-    storage: await getWorkerStorageExecutor(accountId),
-    providerFileIds: input.providerFileIds,
-    movieTitle: input.movieTitle,
-    year: input.year,
-    moviesParentDirectoryId: parents.movies,
+  // Count as in flight: this creates a folder and moves files on the drive. A container
+  // swap mid-way would leave the folder made and the files half moved, and the retry
+  // then fails. /api/update/busy waits for this to settle before the updater swaps.
+  return whileInFlight(async () => {
+    // Recheck the hold now that this import is counted in flight. The action checks it too,
+    // but between that check and this increment the updater could take the hold and see
+    // inFlightCount() === 0 (busy:false), then swap mid-move. Ordering the increment before
+    // this check closes that gap: if the hold is on here, the swap has not been cleared yet.
+    if (isUpdateHoldActive(Date.now())) throw new UpdateInProgressError();
+    // Foreign-work UI is free-text title/year only (no TMDB id). Folder stays the
+    // legacy `Title (Year)` form on purpose — `importForeignWorkAsMovie` supports
+    // `{tmdb-N}` only when a caller passes tmdbId.
+    const accountId = await getCurrentAccountId();
+    const parents = await getWorkerStorageParents(accountId);
+    return importForeignWorkAsMovie({
+      storage: await getWorkerStorageExecutor(accountId),
+      providerFileIds: input.providerFileIds,
+      movieTitle: input.movieTitle,
+      year: input.year,
+      moviesParentDirectoryId: parents.movies,
+    });
   });
 }
 
@@ -2603,6 +3089,20 @@ export class StorageOwnedByOtherAccountError extends Error {
   }
 }
 
+/** A same-account re-login is the re-bind a 掉线 card asks for (「重新绑定即恢复」): store the
+ *  fresh credential and bring the drive back. The upsert deliberately keeps the status,
+ *  so the unfreeze is explicit here; until it runs, patrol and acquisition skip the drive. */
+async function refreshConnectedStorage(
+  repository: ReturnType<typeof getWorkflowRepository>,
+  existing: { id: string; status: "active" | "frozen" },
+  row: Parameters<ReturnType<typeof getWorkflowRepository>["upsertConnectedStorage"]>[0],
+): Promise<void> {
+  await repository.upsertConnectedStorage(row);
+  if (existing.status === "frozen") {
+    await repository.setConnectedStorageStatus(existing.id, "active", null, null);
+  }
+}
+
 /**
  * Shared bind skeleton for the two TOKEN brands (光鸭/天翼): enforce instance-wide
  * ownership, then refresh-or-insert the connected_storage row. The parts that
@@ -2647,7 +3147,7 @@ async function bindTokenConnectedStorage(input: {
   const payload = { ...credentialBlob, meta };
   if (decision.action === "refresh" && existing) {
     // Same account re-login → refresh the credential blob, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
       provider,
@@ -2724,7 +3224,7 @@ async function bindPan115ConnectedStorage(input: {
   };
   if (decision.action === "refresh" && existing) {
     // Keep the already-resolved directory CIDs; only refresh the cookie.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId: input.accountId,
       provider: "pan115",
@@ -2870,7 +3370,7 @@ export async function connectQuarkCookie(rawCookie: string): Promise<{ providerU
   const payload = { cookie, meta: { connectedAt: new Date().toISOString() } };
   if (decision.action === "refresh" && existing) {
     // Same account re-bind → refresh the cookie, keep the resolved CIDs.
-    await repository.upsertConnectedStorage({
+    await refreshConnectedStorage(repository, existing, {
       id: existing.id,
       accountId,
       provider: "quark",

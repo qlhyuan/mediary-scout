@@ -8,12 +8,40 @@ import type { MergedSourceHealth } from "./resource-source-health.js";
  */
 export const DEFAULT_ACCOUNT_ID = "acct_default";
 
+/** Hides rows the previous janitor wrote (`staging-janitor:<storageId>` inbox runs). */
+export function isStagingJanitorId(id: string): boolean {
+  return id.startsWith("staging-janitor");
+}
+
 export type MediaType = "movie" | "tv" | "anime";
 export type SeasonStatus = "active" | "completed";
 export type LatestAiredSource = "metadata" | "manual" | "unknown";
 export type AirStatus = "aired" | "unaired" | "unknown";
 export type MetadataStatus = "confirmed" | "provider_ahead" | "storage_only";
-export type WorkflowKind = "type1_package_init" | "type2_init" | "type3_monitor" | "movie_init";
+/** `replace_request` = a user message asking the agent to swap a bad resource
+ *  (packages/workflow/src/replace-request.ts); it covers every tracked season. */
+/** `staging_recovery` = a silent janitor run that judges one leftover staging dir.
+ *  Users never see it (no notification, no activity row). */
+export type WorkflowKind =
+  | "type1_package_init"
+  | "type2_init"
+  | "type3_monitor"
+  | "movie_init"
+  | "replace_request"
+  | "staging_recovery";
+
+/** Runs of this kind stay off every user-facing list (activity, library, show page). */
+export function isUserVisibleWorkflowKind(kind: WorkflowKind): boolean {
+  return kind !== "staging_recovery";
+}
+
+/** Notice kinds a user must never see. Applied inside the notification queries,
+ *  before the limit, so a leftover row cannot crowd out a real one. */
+export const HIDDEN_NOTIFICATION_KINDS = ["staging_leftover", "staging_recovery"] as const;
+
+export function isUserVisibleNotificationKind(kind: string): boolean {
+  return !(HIDDEN_NOTIFICATION_KINDS as readonly string[]).includes(kind);
+}
 export type WorkflowStatus =
   | "queued"
   | "running"
@@ -25,7 +53,7 @@ export type WorkflowStatus =
    *  releases, but NOT queued/running — the worker never claims it and it is not an
    *  "active" run (see isActiveWorkflowStatus). The air-time gate runs the agent. */
   | "reserved";
-export type ResourceType = "115" | "magnet" | "manual" | "quark" | "tianyi" | "123";
+export type ResourceType = "115" | "magnet" | "manual" | "quark" | "tianyi" | "123" | "guangya";
 export type TransferStatus = "succeeded" | "failed" | "no_target_change";
 export type Confidence = "low" | "medium" | "high";
 
@@ -137,6 +165,42 @@ export interface ResourceSnapshot {
   /** 本次搜索各源的健康态。可选：老快照与不关心健康态的 provider 不带此字段。
    *  缺失时按 healthy 处理（向后兼容），因此新增判定必须显式检查而非假设存在。 */
   sourceHealth?: MergedSourceHealth;
+  /** Optional pre-agent filter trace (see SnapshotPrefilter). Absent when no filter ran. */
+  prefilter?: SnapshotPrefilter;
+}
+
+/** Result of an optional pre-agent candidate filter (today: Jev). Rides the jsonb
+ *  snapshot payload so dropped candidates stay auditable and future evals can be
+ *  replayed from production data. `skipped` = fail-open (nothing was dropped). */
+export interface SnapshotPrefilter {
+  provider: "jev";
+  model: string;
+  /** applied = filtered; skipped = not attempted (nothing judgeable); failed = attempted and errored → fail-open, nothing dropped. */
+  status: "applied" | "skipped" | "failed";
+  /** Why the filter was not applied: skipped (nothing judgeable) or failed (judge
+   *  error/timeout/circuit-open). Never contains secrets. */
+  reason?: string;
+  /** candidateId → P(refers to target) for every judged candidate, dropped ones included. */
+  scores: Record<string, number>;
+  dropped: Array<{ id: string; title: string; score: number }>;
+  /** Candidates the judge scored below dropBelow but that were KEPT because their title
+   *  contains the target title/alias verbatim (structural floor — the one unacceptable
+   *  failure is dropping the right pack). Only present when non-empty. */
+  floored?: Array<{ id: string; title: string; score: number }>;
+  thresholds: { dropBelow: number; uncertainBelow: number };
+  durationMs: number;
+  inputTokens?: number;
+  cost?: number;
+  /** Chunks the judge could not answer (their candidates were kept unjudged). Only
+   *  present when > 0; status stays "applied". */
+  failedChunks?: number;
+  /** candidateId → P(adult content) for every judged candidate. Only present when the
+   *  judge answered the nsfw question. */
+  nsfw?: Record<string, number>;
+  /** Candidates removed as adult content (see isNsfwDrop) — a separate bucket from
+   *  `dropped` (identity) so an audit can tell "wrong work" from "porn". `score` is the
+   *  nsfw probability. Wins over the containment floor. Only present when non-empty. */
+  nsfwDropped?: Array<{ id: string; title: string; score: number }>;
 }
 
 export interface AgentDecision {
@@ -202,6 +266,18 @@ export interface TransferAttempt {
   status: TransferStatus;
   providerMessage: string;
   materializedFileIds: string[];
+  /**
+   * What became of the files this transfer materialized, counted at the end of
+   * its run: kept = moved into a target dir (or landed in the movie dir) and
+   * still there; thrownAway = deleted, discarded with staging, or left in
+   * staging. Absent = not recorded (older runs, or nothing materialized).
+   */
+  fate?: { kept: number; thrownAway: number };
+  /** The names those files actually landed under, parallel to materializedFileIds —
+   *  set only by an executor that knows them and whose landing name can differ from
+   *  the requested one (123 lands a taken name as `name(1).ext`). Absent = the
+   *  requested name. */
+  materializedNames?: string[];
 }
 
 export interface VerifiedFile {
@@ -233,7 +309,8 @@ export type NotificationReportStatus =
   | "partial" // a genuine aired gap remains
   | "no_coverage" // nothing found yet
   | "failed" // acquisition failed terminally (transient retries exhausted, or a hard error)
-  | "retrying"; // transient failure; an automatic retry is scheduled
+  | "retrying" // transient failure; an automatic retry is scheduled
+  | "replaced"; // a user-requested replacement landed (the old file stays beside it)
 
 /**
  * Structured acquisition report. The single source of wording: the web feed

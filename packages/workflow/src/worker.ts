@@ -1,4 +1,5 @@
 import type { LanguageModel } from "ai";
+import { runKeyedPool } from "./keyed-pool.js";
 import type {
   AcquisitionSeasonScope,
   EpisodeState,
@@ -10,21 +11,20 @@ import type {
   WorkflowStatus,
 } from "./domain.js";
 import type { ResourceProvider, StorageExecutor } from "./ports.js";
-import type { PersistedWorkflowRunSnapshot, WorkflowRepository } from "./repository.js";
+import type { PersistedWorkflowRunSnapshot, QueueClaimOptions, WorkflowRepository } from "./repository.js";
 import {
   AUTO_REQUEUE_BACKOFF_MS,
   AUTO_REQUEUE_MAX,
+  claimNextQueuedRun,
   failWorkflowRun,
   requeueWorkflowRunForRetry,
 } from "./repository.js";
 import { isTransientAcquisitionError } from "./acquisition-v2/transient-error.js";
+import type { JevJudge } from "./jev-judge.js";
+import { stagingFailureAuditEvents } from "./acquisition-v2/directory-lifecycle.js";
 import { describeAgentRunError, summarizeErrorForNotification } from "./agent-error.js";
 import { formatReportPushText } from "./notification-report.js";
 import { isMovieUnreleased } from "./domain.js";
-import { isGuangYaAuthError } from "./guangya-client.js";
-import { isPan115AuthError } from "./pan115-cookie-client.js";
-import { isPan123AuthError } from "./pan123-client.js";
-import { isQuarkAuthError } from "./quark-cookie-client.js";
 import {
   runMovieAcquisitionV2AndPersist,
   runSeriesInitializationV2AndPersist,
@@ -32,18 +32,11 @@ import {
   runType3MonitoringV2AndPersist,
 } from "./runner-v2.js";
 import { syncSeasonAgainstMetadata } from "./season-sync.js";
-import { isTianyiAuthError } from "./tianyi-client.js";
-
-/** Brand netdisk auth failures only — never LLM Unauthorized / plain Errors. */
-function isBrandStorageAuthError(error: unknown): boolean {
-  return (
-    isPan115AuthError(error) ||
-    isQuarkAuthError(error) ||
-    isGuangYaAuthError(error) ||
-    isTianyiAuthError(error) ||
-    isPan123AuthError(error)
-  );
-}
+import { isBrandStorageAuthError } from "./storage-auth-error.js";
+import { userMessageDrive, type UserMessageScope } from "./user-requests.js";
+// Circular with replace-request.ts (it uses this module's claim helpers); both sides
+// only call the other's functions at run time, never at module evaluation.
+import { queueReplaceRequest } from "./replace-request.js";
 
 async function maybeFreezeOnBrandAuthError(input: {
   connectedStorageId: string | null | undefined;
@@ -69,7 +62,7 @@ async function maybeFreezeOnBrandAuthError(input: {
  * (when configured) so the 动漫 library shelf is a physically separate tree,
  * never intermixed with TV shows; everything else uses the default parent.
  */
-function storageParentForTitle(
+export function storageParentForTitle(
   title: { type: MediaType },
   storageParentDirectoryId: string | undefined,
   animeStorageParentDirectoryId: string | undefined,
@@ -85,7 +78,7 @@ function storageParentForTitle(
  * globally-passed deps. Per-account fields (115 storage + landing CIDs) win;
  * everything else falls through to the base. No resolver → base unchanged.
  */
-async function resolveWorkerDeps(
+export async function resolveWorkerDeps(
   resolve: ResolveAccountWorkerContext | undefined,
   accountId: string,
   connectedStorageId: string | null,
@@ -102,6 +95,8 @@ async function resolveWorkerDeps(
   qualityPreference: "high" | "medium" | undefined;
   storageProvider: string | undefined;
   assrtToken: string | undefined;
+  jevJudge: JevJudge | undefined;
+  agentMemory: boolean | undefined;
   storageParentDirectoryId: string | undefined;
   animeStorageParentDirectoryId: string | undefined;
   moviesParentDirectoryId: string | undefined;
@@ -115,6 +110,11 @@ async function resolveWorkerDeps(
     qualityPreference: ctx.qualityPreference ?? base.qualityPreference,
     storageProvider: ctx.storageProvider ?? base.storageProvider,
     assrtToken: ctx.assrtToken ?? base.assrtToken,
+    // Jev is per-account opt-in: with a resolver, its answer is authoritative even
+    // when it has no judge — an account that never configured (or switched off) the
+    // prefilter must not inherit a judge that happens to ride in the base deps.
+    jevJudge: resolve ? ctx.jevJudge : base.jevJudge,
+    agentMemory: ctx.agentMemory ?? base.agentMemory,
     storageParentDirectoryId:
       ctx.storageParentDirectoryId ?? base.storageParentDirectoryId,
     animeStorageParentDirectoryId:
@@ -142,6 +142,11 @@ export type SeasonMetadataSync = (input: {
  * language fall through to the globally-passed values. No resolver → the function
  * uses its input deps unchanged (single-user / tests).
  */
+/** Asked right before a run is claimed or reserved as running. False = start nothing
+ *  now (the web process is about to be replaced by an update); queued runs stay
+ *  queued. Absent = always allowed. */
+export type MayStartRun = () => boolean;
+
 export interface AccountWorkerContext {
   storage?: StorageExecutor;
   resourceProvider?: ResourceProvider;
@@ -152,6 +157,10 @@ export interface AccountWorkerContext {
   storageProvider?: string;
   /** assrt token (Settings → 字幕来源). Undefined = 字幕流程不触发。 */
   assrtToken?: string;
+  /** Optional Jev candidate prefilter, resolved per account from Settings. */
+  jevJudge?: JevJudge;
+  /** Agent memory on/off, resolved per account from Settings (absent = on). */
+  agentMemory?: boolean;
   storageParentDirectoryId?: string;
   animeStorageParentDirectoryId?: string;
   moviesParentDirectoryId?: string;
@@ -184,8 +193,11 @@ function failureReport(
 ): NotificationReport {
   return {
     titleName: claimed.title.title,
+    // A replace_request covers every tracked season of the work and is only recorded
+    // on its lowest one (the lock): naming that season would label an S02 request
+    // 「第 1 季」. Title-level, like its success report (buildReplacementReport).
     seasonLabel:
-      claimed.title.type !== "movie" && claimed.season.seasonNumber
+      claimed.title.type !== "movie" && claimed.workflowRun.kind !== "replace_request" && claimed.season.seasonNumber
         ? `第 ${claimed.season.seasonNumber} 季`
         : null,
     status,
@@ -213,6 +225,10 @@ export async function handleWorkflowRunFailure(input: {
   now: () => string;
   /** Freeze the run's connected drive on brand *AuthError (cookie/token dead). */
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  /** Trigger stamped on the failure/retry notification. Default "user" (individual push).
+   *  A patrol-origin replace run passes "scheduled" so its failure joins the daily digest,
+   *  matching the success path (stampReplaceNotification). */
+  notificationTrigger?: "user" | "scheduled";
 }): Promise<{ status: "auto_requeued" | "failed"; workflowRunId: string; errorMessage: string }> {
   const { claimed, error, repository } = input;
   const nowIso = input.now();
@@ -226,10 +242,19 @@ export async function handleWorkflowRunFailure(input: {
   const transient = isTransientAcquisitionError(error);
   const willRetry = transient && priorCount < AUTO_REQUEUE_MAX;
 
+  // A staging dir that survived the harness cleanup on this failed body rides on
+  // the error (attachStagingLeaks). This handler is the ONLY persist path for a
+  // failed/requeued run, so the leak is recorded here or nowhere (Copilot #260 r1).
+  const leakEvents = stagingFailureAuditEvents(error);
+  const claimedRun =
+    leakEvents.length === 0
+      ? claimed.workflowRun
+      : { ...claimed.workflowRun, auditEvents: [...claimed.workflowRun.auditEvents, ...leakEvents] };
+
   let report: NotificationReport;
   let workflowRun;
   if (willRetry) {
-    workflowRun = requeueWorkflowRunForRetry(claimed.workflowRun, errorMessage, nowIso);
+    workflowRun = requeueWorkflowRunForRetry(claimedRun, errorMessage, nowIso);
     const minutes = Math.round((AUTO_REQUEUE_BACKOFF_MS[priorCount] ?? 0) / 60_000);
     // 把真实报因摘要带进「重试中」通知——以前一律「网络波动」把根因藏了,
     // 用户和我们都得翻日志才知道发生了什么(issue #196)。摘要已脱敏+截断,
@@ -239,10 +264,12 @@ export async function handleWorkflowRunFailure(input: {
       `原因:${summarizeErrorForNotification(errorMessage)}`,
     ]);
   } else {
-    workflowRun = failWorkflowRun(claimed.workflowRun, errorMessage, nowIso);
+    workflowRun = failWorkflowRun(claimedRun, errorMessage, nowIso);
     report = failureReport(claimed, "failed", [
       transient ? `网络中断,已自动重试 ${priorCount} 次仍失败` : "获取失败",
-      errorMessage,
+      // Pushed verbatim by formatReportPushText, so the same redaction as the retry
+      // line; the raw message stays in the run row (failWorkflowRun) for forensics.
+      summarizeErrorForNotification(errorMessage),
     ]);
   }
   const notification: NotificationEvent = {
@@ -252,9 +279,18 @@ export async function handleWorkflowRunFailure(input: {
     title: claimed.title.title,
     body: formatReportPushText(report),
     createdAt: nowIso,
-    trigger: "user",
+    trigger: input.notificationTrigger ?? "user",
     report,
   };
+  // One stdout line per failure (console.log — stdout, beside the worker's other
+  // lines). Without it the only trace is the run row, which a user retry/cancel
+  // deletes — the 《出入平安》 timeout cause (2026-09-24) had to be dug out of dead
+  // Postgres heap tuples. Same redaction as the push line.
+  // Emitted BEFORE persistence: if the save below rejects, this line is the only record.
+  console.log(
+    `[workflow] run ${claimed.workflowRun.id} ${claimed.workflowRun.kind} ${willRetry ? "auto_requeued" : "failed"}` +
+      ` (storage ${claimed.connectedStorageId ?? "-"}): ${summarizeErrorForNotification(errorMessage)}`,
+  );
   // saveWorkflowRunSnapshot DELETES the season's episode bucket then re-inserts
   // only what we pass. The two branches need OPPOSITE handling:
   //  - auto-requeue: the run is going BACK to queued (still in flight) → preserve
@@ -263,17 +299,26 @@ export async function handleWorkflowRunFailure(input: {
   //  - terminal failure: a failed Type 2 init intentionally clears its initial
   //    episode state so a fresh, never-acquired season doesn't linger as tracked
   //    (see worker.test "clears initial episode state when the agent model dies").
+  //    A replace_request is the exception: it runs on a library that already has
+  //    files, and a failed replace must leave that library exactly as it was.
+  // A staging recovery runs on a library that already has files, and its failure
+  // is not the user's problem: write no notification, and do not touch the
+  // episode bucket. The claimed copy is from queue time on InMemory, and a user
+  // run is allowed to mark episodes while this recovery sits queued.
+  const silent = claimed.workflowRun.kind === "staging_recovery";
+  const keepEpisodes = willRetry || claimed.workflowRun.kind === "replace_request";
   await repository.saveWorkflowRunSnapshot({
     accountId: claimed.accountId,
     connectedStorageId: claimed.connectedStorageId,
     title: claimed.title,
     season: claimed.season,
     workflowRun,
-    episodes: willRetry ? claimed.episodes : [],
+    episodes: keepEpisodes ? claimed.episodes : [],
     resourceSnapshots: willRetry ? claimed.resourceSnapshots : [],
     decisions: willRetry ? claimed.decisions : [],
     transferAttempts: willRetry ? claimed.transferAttempts : [],
-    notifications: [notification],
+    notifications: silent ? [] : [notification],
+    ...(silent ? { keepCurrentEpisodes: true } : {}),
   });
   // Brand auth (dead cookie/token) — freeze the drive so the queue refuses more
   // work until re-bound. LLM Unauthorized is NOT a brand AuthError; only the
@@ -304,23 +349,27 @@ export async function runQueuedType2Workflow(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
+  /** The worker's drive filter and claim callback when queued runs go side by side. */
+  claim?: QueueClaimOptions;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
-  const claimed = await input.repository.claimNextQueuedWorkflowRun({
-    kind: "type2_init",
-    now: now(),
-  });
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
+  const claimed = await claimNextQueuedRun(input.repository, "type2_init", now(), input.claim);
   if (!claimed) {
     return { status: "idle" };
   }
-  const deps = await resolveWorkerDeps(
-    input.resolveAccountContext,
-    claimed.accountId,
-    claimed.connectedStorageId,
-    input,
-  );
-
+  // Inside the try: a throw here (drive gone, settings cleared, a DB blip) must end the
+  // claimed run through the failure handler, not leave it "running".
   try {
+    const deps = await resolveWorkerDeps(
+      input.resolveAccountContext,
+      claimed.accountId,
+      claimed.connectedStorageId,
+      input,
+    );
     const result = await runType2InitializationV2AndPersist({
       title: claimed.title,
       season: claimed.season,
@@ -349,6 +398,12 @@ export async function runQueuedType2Workflow(input: {
       ...(deps.assrtToken === undefined
         ? {}
         : { assrtToken: deps.assrtToken }),
+      ...(deps.jevJudge === undefined
+        ? {}
+        : { jevJudge: deps.jevJudge }),
+      ...(deps.agentMemory === undefined
+        ? {}
+        : { agentMemory: deps.agentMemory }),
       // finishedAt is stamped post-run inside the persist step (see runner-v2),
       // so it reflects actual completion, not the claim time.
       workflowRun: {
@@ -384,6 +439,11 @@ export type ScheduledType3Outcome =
   | {
       trackedSeasonId: string;
       status: "skipped_active";
+    }
+  | {
+      /** Untracked after the sweep read it: nothing was written, nothing ran. */
+      trackedSeasonId: string;
+      status: "skipped_untracked";
     }
   | {
       trackedSeasonId: string;
@@ -427,13 +487,132 @@ export async function runScheduledType3Monitoring(input: {
    *  The sweep is cross-account; each show runs under its owner's credentials. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  /** How many shows the sweep works on at once (default 1 = one after another).
+   *  Never two on the same drive — see runKeyedPool. */
+  maxConcurrentRuns?: number;
+  /** The drive an account's unbound shows land on (its default drive). Used only
+   *  to keep those shows off the same drive as its bound ones when running in
+   *  parallel; null when the account has no drive. */
+  resolveDriveId?: (accountId: string) => Promise<string | null>;
+  /** Checked before each show's run is reserved; a false stops the rest of the sweep
+   *  from starting (those shows are reported skipped_active). */
+  mayStartRun?: MayStartRun;
 }): Promise<ScheduledType3Outcome[]> {
   const now = input.now ?? (() => new Date().toISOString());
-  const outcomes: ScheduledType3Outcome[] = [];
   // Cross-account: patrol EVERY user's tracked shows, each under its owner's creds.
   const trackedStates = await input.repository.listAllTrackedSeasonStates();
 
-  for (const state of trackedStates) {
+  // Works with a user message or an unfinished replacement run as ONE replace_request
+  // (it covers every season and includes the gaps), so this sweep skips their seasons.
+  // Queued, not run here: the queue worker claims it right after the sweep.
+  const workKey = (w: UserMessageScope) => JSON.stringify([w.accountId, w.drive, w.titleKey]);
+  const requestWorks = [
+    ...(await input.repository.listWorksWithPendingMessages({ urgentOnly: false })),
+    ...(await input.repository.listWorksWithPendingReplacements()),
+  ];
+  const requestKeys = new Set(requestWorks.map(workKey));
+
+  // The drive a show runs on: its bound drive, else its account's default drive (null:
+  // no drive at all → the process-wide fallback executor). One lookup per account.
+  const defaultDrives = new Map<string, Promise<string | null>>();
+  const defaultDriveOf = (accountId: string) => {
+    let drive = defaultDrives.get(accountId);
+    if (!drive) {
+      drive = input.resolveDriveId ? input.resolveDriveId(accountId) : Promise.resolve(null);
+      defaultDrives.set(accountId, drive);
+    }
+    return drive;
+  };
+  // A frozen drive's login is dead: every call on it fails until the drive is re-bound.
+  // Its shows and requests wait untouched (no run, no call to the drive) and are
+  // patrolled again once the drive is active.
+  const frozenDrives = new Set<string>();
+  for (const accountId of new Set([...trackedStates, ...requestWorks].map((item) => item.accountId))) {
+    for (const storage of await input.repository.listConnectedStorages(accountId)) {
+      if (storage.status === "frozen") frozenDrives.add(storage.id);
+    }
+  }
+  const skippedOnFrozen = new Map<string, number>();
+  const onFrozenDrive = async (accountId: string, connectedStorageId: string | null) => {
+    const drive = connectedStorageId ?? (await defaultDriveOf(accountId));
+    if (drive === null || !frozenDrives.has(drive)) return false;
+    skippedOnFrozen.set(drive, (skippedOnFrozen.get(drive) ?? 0) + 1);
+    return true;
+  };
+
+  for (const key of requestKeys) {
+    const [accountId, drive, titleKey] = JSON.parse(key) as [string, string, string];
+    // Still in requestKeys, so the ordinary patrol leaves the work alone too.
+    if (await onFrozenDrive(accountId, drive === "" ? null : drive)) continue;
+    try {
+      await queueReplaceRequest({ repository: input.repository, work: { accountId, drive, titleKey }, now, origin: "patrol" });
+    } catch (error) {
+      // One work's queueing failure must not abort the whole sweep; the next sweep retries it.
+      console.error(`[user-message] patrol could not queue a replace request for ${titleKey}: ${String(error)}`);
+    }
+  }
+  // Also skip a title whose replace run or leftover recovery is already active.
+  // Patrols run outside the queue drain, so either would move files in the same
+  // directories at the same time. This filter is only the cheap path; a run queued
+  // after it is caught by the patrol reservation (blockIfTitleHasActiveKinds).
+  // The janitor will not queue a recovery while any run of the title is active,
+  // so the exclusion holds both ways.
+  const busyKeys = new Set((await input.repository.listWorksWithProcessingMessages()).map(workKey));
+  for (const accountId of new Set(trackedStates.map((s) => s.accountId))) {
+    for (const run of await input.repository.listActiveWorkflowRuns({ accountId, connectedStorageId: null })) {
+      if (run.workflowRun.kind !== "replace_request" && run.workflowRun.kind !== "staging_recovery") continue;
+      busyKeys.add(workKey({ accountId, drive: userMessageDrive(run.connectedStorageId), titleKey: run.title.id }));
+    }
+  }
+  const patrolStates: typeof trackedStates = [];
+  for (const s of trackedStates) {
+    const key = workKey({ accountId: s.accountId, drive: userMessageDrive(s.connectedStorageId), titleKey: s.title.id });
+    if (requestKeys.has(key) || busyKeys.has(key)) continue;
+    if (await onFrozenDrive(s.accountId, s.connectedStorageId)) continue;
+    patrolStates.push(s);
+  }
+  for (const [drive, count] of skippedOnFrozen) {
+    console.log(`[patrol] drive ${drive} is frozen (login expired): skipped ${count} item(s) until it is re-bound`);
+  }
+
+  // One drive at a time, several drives side by side (see runKeyedPool). The key
+  // is the drive the run will actually land on: a state with no bound drive runs
+  // on its account's default drive, so it must share that drive's key, not get
+  // one of its own.
+  const concurrency = input.maxConcurrentRuns ?? 1;
+  const driveKeys =
+    concurrency > 1
+      ? await Promise.all(
+          patrolStates.map(async (state) => {
+            const drive = state.connectedStorageId ?? (await defaultDriveOf(state.accountId));
+            // No drive at all → the process-wide fallback executor (env cookie / fake),
+            // which every such account shares: one key for all of them.
+            return drive ?? "no-connected-drive";
+          }),
+        )
+      : [];
+  const keyByState = new Map(patrolStates.map((state, index) => [state, driveKeys[index] ?? ""]));
+  // A throw from one state's setup (drive client, DB reservation) is an infra
+  // failure: it aborts the sweep as the serial loop did, so the caller can release
+  // today's claimed slots and retry. Failures inside a run are outcomes, not throws.
+  const perState = await runKeyedPool(
+    patrolStates,
+    { concurrency, keyOf: (state) => keyByState.get(state)! },
+    (state) => patrolTrackedState({ input, state, now }),
+  );
+  return perState.filter((outcome): outcome is ScheduledType3Outcome => outcome !== null);
+}
+
+type ScheduledType3Input = Parameters<typeof runScheduledType3Monitoring>[0];
+
+/** One tracked state's patrol; null when there is nothing to do for it. */
+async function patrolTrackedState(args: {
+  input: ScheduledType3Input;
+  state: Awaited<ReturnType<WorkflowRepository["listAllTrackedSeasonStates"]>>[number];
+  now: () => string;
+}): Promise<ScheduledType3Outcome | null> {
+  const { input, state, now } = args;
+  {
     const deps = await resolveWorkerDeps(
       input.resolveAccountContext,
       state.accountId,
@@ -444,15 +623,11 @@ export async function runScheduledType3Monitoring(input: {
     // TV/anime agent (different semantics). (未上映/reserved films aren't tracked
     // yet; the air-time gate lands with that product state.)
     if (state.title.type === "movie") {
-      const outcome = await patrolMovie({ input, deps, state, now });
-      if (outcome) {
-        outcomes.push(outcome);
-      }
-      continue;
+      return (await patrolMovie({ input, deps, state, now })) ?? null;
     }
 
     if (state.season.status !== "active" || state.episodes.length === 0) {
-      continue;
+      return null;
     }
 
     // sync_all equivalent: refresh aired/total from TMDB so episodes that aired
@@ -475,8 +650,10 @@ export async function runScheduledType3Monitoring(input: {
           season = synced.season;
           episodes = synced.episodes;
         }
-      } catch {
-        // Metadata sync is best-effort; fall back to stored counts.
+      } catch (error) {
+        console.warn(
+          `[patrol] metadata sync failed tmdbId=${state.title.tmdbId} season=${state.season.seasonNumber}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
 
@@ -487,6 +664,9 @@ export async function runScheduledType3Monitoring(input: {
       input.staleActiveRunTimeoutMs,
     );
 
+    if (input.mayStartRun && !input.mayStartRun()) {
+      return { trackedSeasonId: season.id, status: "skipped_active" };
+    }
     const reservation = await input.repository.reserveWorkflowRun({
       accountId: state.accountId,
       connectedStorageId: state.connectedStorageId,
@@ -511,13 +691,23 @@ export async function runScheduledType3Monitoring(input: {
       decisions: [],
       transferAttempts: [],
       notifications: [],
+      // Patrols run outside the queue drain. A replace, or a leftover recovery the
+      // drain can claim mid-patrol, moves files in the same directories. The
+      // janitor will not queue a recovery while this patrol is active, so the
+      // exclusion holds both ways.
+      blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
+      // The state was read when the sweep started (then the drive's deps, a TMDB sync):
+      // a season untracked since must not be tracked again by this reservation.
+      requireTrackedSeason: true,
       ...(staleActiveRunStartedBefore === null
         ? {}
         : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
     });
+    if (reservation.status === "not_tracked") {
+      return { trackedSeasonId: season.id, status: "skipped_untracked" };
+    }
     if (reservation.status !== "reserved") {
-      outcomes.push({ trackedSeasonId: season.id, status: "skipped_active" });
-      continue;
+      return { trackedSeasonId: season.id, status: "skipped_active" };
     }
 
     try {
@@ -550,15 +740,21 @@ export async function runScheduledType3Monitoring(input: {
         ...(deps.assrtToken === undefined
           ? {}
           : { assrtToken: deps.assrtToken }),
+        ...(deps.jevJudge === undefined
+          ? {}
+          : { jevJudge: deps.jevJudge }),
+        ...(deps.agentMemory === undefined
+          ? {}
+          : { agentMemory: deps.agentMemory }),
         workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
         now,
       });
-      outcomes.push({
+      return {
         trackedSeasonId: state.season.id,
         status: "ran",
         workflowRunId,
         workflowStatus: result.status,
-      });
+      };
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Workflow failed";
@@ -579,6 +775,7 @@ export async function runScheduledType3Monitoring(input: {
               type: "type3_scheduled",
               message: "Scheduled Type 3 monitoring reserved",
             },
+            ...stagingFailureAuditEvents(error),
             { type: "workflow_failed", message: errorMessage },
           ],
         },
@@ -595,16 +792,14 @@ export async function runScheduledType3Monitoring(input: {
           ? {}
           : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
       });
-      outcomes.push({
+      return {
         trackedSeasonId: state.season.id,
         status: "failed",
         workflowRunId,
         errorMessage,
-      });
+      };
     }
   }
-
-  return outcomes;
 }
 
 /**
@@ -618,6 +813,7 @@ async function patrolMovie(args: {
     createWorkflowRunId?: () => string;
     staleActiveRunTimeoutMs?: number;
     onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+    mayStartRun?: MayStartRun;
   };
   deps: {
     resourceProvider: ResourceProvider;
@@ -627,6 +823,8 @@ async function patrolMovie(args: {
     qualityPreference: "high" | "medium" | undefined;
     storageProvider: string | undefined;
     assrtToken: string | undefined;
+    jevJudge: JevJudge | undefined;
+    agentMemory: boolean | undefined;
     moviesParentDirectoryId: string | undefined;
   };
   state: {
@@ -660,6 +858,9 @@ async function patrolMovie(args: {
     startedAt,
     input.staleActiveRunTimeoutMs,
   );
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { trackedSeasonId: state.season.id, status: "skipped_active" };
+  }
   const reservation = await input.repository.reserveWorkflowRun({
     accountId: state.accountId,
     connectedStorageId: state.connectedStorageId,
@@ -684,10 +885,17 @@ async function patrolMovie(args: {
     decisions: [],
     transferAttempts: [],
     notifications: [],
+    // Same as the TV patrol: a replace or a leftover recovery queued after the filter.
+    blockIfTitleHasActiveKinds: ["replace_request", "staging_recovery"],
+    // …and an untrack after the sweep read the film.
+    requireTrackedSeason: true,
     ...(staleActiveRunStartedBefore === null
       ? {}
       : { staleActiveRunStartedBefore, staleFinishedAt: startedAt }),
   });
+  if (reservation.status === "not_tracked") {
+    return { trackedSeasonId: state.season.id, status: "skipped_untracked" };
+  }
   if (reservation.status !== "reserved") {
     return { trackedSeasonId: state.season.id, status: "skipped_active" };
   }
@@ -714,6 +922,14 @@ async function patrolMovie(args: {
       ...(deps.assrtToken === undefined
         ? {}
         : { assrtToken: deps.assrtToken }),
+      ...(deps.jevJudge === undefined
+        ? {}
+        : { jevJudge: deps.jevJudge }),
+      ...(deps.agentMemory === undefined
+        ? {}
+        : { agentMemory: deps.agentMemory }),
+      // Reported in the sweep's daily digest, like the shows, not pushed on its own.
+      notice: { trigger: "scheduled", routineIfNothingReplaced: false },
       workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
       now,
     });
@@ -743,6 +959,7 @@ async function patrolMovie(args: {
             type: "movie_patrol_scheduled",
             message: "Scheduled movie patrol reserved",
           },
+          ...stagingFailureAuditEvents(error),
           { type: "workflow_failed", message: errorMessage },
         ],
       },
@@ -790,7 +1007,7 @@ function staleStartedBefore(
  * (Movies/TV/Anime); a missing parent is a misconfiguration, not a silent
  * account-root fallback (fail loud — see acquisition-hard-details).
  */
-function requireCategoryParent(parent: string | undefined): string {
+export function requireCategoryParent(parent: string | undefined): string {
   if (parent === undefined || parent === "") {
     throw new Error(
       "MEDIA_TRACK_CATEGORY_PARENT_REQUIRED: a library category parent (Movies/TV/Anime) is required for directory verify-or-create",
@@ -811,23 +1028,27 @@ export async function runQueuedMovieAcquisition(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
+  /** The worker's drive filter and claim callback when queued runs go side by side. */
+  claim?: QueueClaimOptions;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
-  const claimed = await input.repository.claimNextQueuedWorkflowRun({
-    kind: "movie_init",
-    now: now(),
-  });
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
+  const claimed = await claimNextQueuedRun(input.repository, "movie_init", now(), input.claim);
   if (!claimed) {
     return { status: "idle" };
   }
-  const deps = await resolveWorkerDeps(
-    input.resolveAccountContext,
-    claimed.accountId,
-    claimed.connectedStorageId,
-    input,
-  );
-
+  // Inside the try: a throw here (drive gone, settings cleared, a DB blip) must end the
+  // claimed run through the failure handler, not leave it "running".
   try {
+    const deps = await resolveWorkerDeps(
+      input.resolveAccountContext,
+      claimed.accountId,
+      claimed.connectedStorageId,
+      input,
+    );
     const result = await runMovieAcquisitionV2AndPersist({
       title: claimed.title,
       categoryParentId:
@@ -850,6 +1071,12 @@ export async function runQueuedMovieAcquisition(input: {
       ...(deps.assrtToken === undefined
         ? {}
         : { assrtToken: deps.assrtToken }),
+      ...(deps.jevJudge === undefined
+        ? {}
+        : { jevJudge: deps.jevJudge }),
+      ...(deps.agentMemory === undefined
+        ? {}
+        : { agentMemory: deps.agentMemory }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,
@@ -893,29 +1120,32 @@ export async function runQueuedSeriesInitialization(input: {
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
   resolveAccountContext?: ResolveAccountWorkerContext;
   onAuthErrorFreeze?: (storageId: string, reason: string) => Promise<void>;
+  mayStartRun?: MayStartRun;
+  /** The worker's drive filter and claim callback when queued runs go side by side. */
+  claim?: QueueClaimOptions;
 }): Promise<QueuedType2WorkerResult> {
   const now = input.now ?? (() => new Date().toISOString());
-  const claimed = await input.repository.claimNextQueuedWorkflowRun({
-    kind: "type1_package_init",
-    now: now(),
-  });
+  if (input.mayStartRun && !input.mayStartRun()) {
+    return { status: "idle" };
+  }
+  const claimed = await claimNextQueuedRun(input.repository, "type1_package_init", now(), input.claim);
   if (!claimed) {
     return { status: "idle" };
   }
-  const deps = await resolveWorkerDeps(
-    input.resolveAccountContext,
-    claimed.accountId,
-    claimed.connectedStorageId,
-    input,
-  );
-
   const queuedEvent = claimed.workflowRun.auditEvents.find(
     (event) => event.type === "series_init_queued",
   );
   const seasons = (queuedEvent?.data?.["seasons"] ??
     []) as AcquisitionSeasonScope[];
 
+  // Inside the try, as in the other queued runners.
   try {
+    const deps = await resolveWorkerDeps(
+      input.resolveAccountContext,
+      claimed.accountId,
+      claimed.connectedStorageId,
+      input,
+    );
     if (seasons.length === 0) {
       throw new Error(
         "Queued series initialization run is missing its season metadata",
@@ -950,6 +1180,12 @@ export async function runQueuedSeriesInitialization(input: {
       ...(deps.assrtToken === undefined
         ? {}
         : { assrtToken: deps.assrtToken }),
+      ...(deps.jevJudge === undefined
+        ? {}
+        : { jevJudge: deps.jevJudge }),
+      ...(deps.agentMemory === undefined
+        ? {}
+        : { agentMemory: deps.agentMemory }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,

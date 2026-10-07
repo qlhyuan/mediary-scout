@@ -293,8 +293,15 @@ export async function importForeignWorkAction(input: {
   if (input.providerFileIds.length === 0) {
     return { status: "failed", message: "没有可入库的文件。" };
   }
+  const { importForeignWorkFiles, isUpdateInProgress, UpdateInProgressError } = await import("../lib/workflow-runtime");
+  // A container swap mid-import leaves a half-moved folder the retry can't finish. Refuse
+  // upfront while the updater holds new work; importForeignWorkFiles rechecks the hold once
+  // it is counted in flight and throws UpdateInProgressError if the hold was taken in the
+  // gap between here and there, so the swap handshake cannot win that race.
+  if (isUpdateInProgress()) {
+    return { status: "failed", message: "正在更新，更新完成后再入库。" };
+  }
   try {
-    const { importForeignWorkFiles } = await import("../lib/workflow-runtime");
     await importForeignWorkFiles({
       providerFileIds: input.providerFileIds,
       movieTitle,
@@ -306,6 +313,9 @@ export async function importForeignWorkAction(input: {
       message: `已入库到 ${movieTitle} (${year})。`,
     };
   } catch (error) {
+    if (error instanceof UpdateInProgressError) {
+      return { status: "failed", message: "正在更新，更新完成后再入库。" };
+    }
     return { status: "failed", message: `入库失败：${String(error)}` };
   }
 }
@@ -479,12 +489,31 @@ export async function saveDailySweepTimesAction(times: string[]): Promise<PushSe
   }
 }
 
+export async function savePatrolConcurrencyAction(value: number): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, PATROL_CONCURRENCY_SETTING_KEY, MAX_PATROL_CONCURRENCY } = await import(
+      "../lib/workflow-runtime"
+    );
+    if (!Number.isInteger(value) || value < 1 || value > MAX_PATROL_CONCURRENCY) {
+      return { success: false, message: `只能是 1 到 ${MAX_PATROL_CONCURRENCY}` };
+    }
+    await getWorkflowRepository().setSetting(PATROL_CONCURRENCY_SETTING_KEY, String(value));
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
 /** 手动触发一次全量巡检（force：跑完整 sweep 但不认领定时 slot，run-now 不吞计划）。 */
 export async function runPatrolNowAction(): Promise<PushSettingsActionResult & { checked?: number }> {
   assertNotDemo();
   try {
     const { runScheduledType3 } = await import("../lib/workflow-runtime");
     const result = await runScheduledType3({ force: true });
+    if (result.skipped === "update_in_progress") {
+      return { success: false, message: "正在更新，更新完成后再巡检。" };
+    }
     return { success: true, checked: result.outcomes.length };
   } catch (error) {
     return { success: false, message: `巡检失败：${String(error)}` };
@@ -713,6 +742,125 @@ export async function clearProwlarrConfigAction(): Promise<PushSettingsActionRes
   }
 }
 
+export async function saveJevConfigAction(input: {
+  apiKey: string;
+  baseUrl: string;
+}): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const {
+      getWorkflowRepository,
+      getCurrentAccountId,
+      getAccountScopedSettings,
+      getJevConfig,
+      getJevInheritedBaseUrl,
+      JEV_API_KEY_SETTING_KEY,
+      JEV_BASE_URL_SETTING_KEY,
+      JEV_HEALTH_SETTING_KEY,
+      JEV_PREFILTER_ENABLED_SETTING_KEY,
+      JEV_PROBED_FOR_SETTING_KEY,
+      jevConfigFingerprint,
+      JEV_MODEL_SETTING_KEY,
+    } = await import("../lib/workflow-runtime");
+    const { probeJev, validateJevBaseUrlFormat } = await import("../lib/jev-probe");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    // 留空 = 沿用当前**生效**的配置(account → 全局 → env) —— 与表单上「已设置」
+    // 占位符同一条规则。只读 account 行的话,一个存在于全局作用域或 env 的 key
+    // 会在这里被判成「没有 key」;而 enabled/health 只有这个 action 会写,于是
+    // 纯 env 部署永远激活不了。
+    const scoped = getAccountScopedSettings(accountId, repository);
+    const effective = await getJevConfig(scoped);
+    const typedKey = input.apiKey.trim();
+    const apiKey = typedKey || effective.apiKey || "";
+    if (!apiKey) return { success: false, message: "需要 Jev API Key（OpenRouter 的 sk-or-… 或 TypeSafe 官方控制台的 Key 都可以）。" };
+    const typedUrl = input.baseUrl.trim();
+    // 自定义地址只配**本账号自己的** Key。key 可能继承自实例(全局行或 env):允许
+    // 「只改地址」,等于让任一账号把共享 Key 发到它自己挑的服务器——探活发一次,之后
+    // 每次搜索都发(多用户)。读取端(getJevConfig)对这种状态同样视为未测、零调用。
+    const ownKey = typedKey || (await repository.getAccountSetting(accountId, JEV_API_KEY_SETTING_KEY))?.trim() || "";
+    if (typedUrl && !ownKey) {
+      return {
+        success: false,
+        message:
+          "自定义 Base URL 需要同时填你自己的 Key：当前用的是实例共享的 Jev Key，它只会发往实例配置的地址。清空 Base URL，或填上你自己的 Key 再保存。未保存。",
+      };
+    }
+    // 留空的 URL 会存成 ""(=去掉 account 覆盖),保存后真正生效的是 全局 → env → 默认。
+    // 探活必须打**那个**地址:沿用 effective.baseUrl 会打到即将被清掉的旧覆盖,
+    // 于是一个从没测过的端点被记成 healthy + enabled。
+    const baseUrl = typedUrl || (await getJevInheritedBaseUrl(repository));
+    // 先跑便宜的格式校验:漏写 scheme 的地址否则要耗满 8s 探活,再换回一句
+    // 含糊的「连不上」,而真正的问题是格式(与 PanSou 同一条规则)。只校验用户这次
+    // 输入的地址:继承来的(全局/env)是运营方的配置,不拿 http 规则去拦它。
+    if (typedUrl) {
+      const format = validateJevBaseUrlFormat(typedUrl);
+      if (!format.ok) return { success: false, message: format.message };
+    }
+    // 存之前真打一次:一个打不通的 key 被保存后,预筛会在每次搜索上静默 fail-open,
+    // 用户以为开了其实从没生效 —— 与 PanSou 自建源「活了 6 天」是同一种病。
+    const probe = await probeJev({ apiKey, baseUrl });
+    if (!probe.ok) return { success: false, message: probe.message };
+    // 只写用户**这次真输入**的内容:留空的 key 不重写(全局/env 的 key 不会被
+    // 复制进 account 行),留空的 URL 写 ""=无覆盖(同 Prowlarr),否则今天的默认
+    // 端点会被冻进 DB,日后改 env JEV_BASE_URL 也推不动它。
+    if (typedKey) await repository.setAccountSetting(accountId, JEV_API_KEY_SETTING_KEY, typedKey);
+    await repository.setAccountSetting(accountId, JEV_BASE_URL_SETTING_KEY, typedUrl);
+    await repository.setAccountSetting(accountId, JEV_HEALTH_SETTING_KEY, "ok");
+    // 记下这次探活的是哪套 key/URL:之后 env 换了 key 或端点挪了,读取端就把 "ok"
+    // 当成未测(见 getJevConfig),而不是顶着旧结论让每次搜索静默 fail-open。
+    await repository.setAccountSetting(accountId, JEV_PROBED_FOR_SETTING_KEY, jevConfigFingerprint(apiKey, baseUrl));
+    await repository.setAccountSetting(accountId, JEV_MODEL_SETTING_KEY, probe.model);
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, "1");
+    return { success: true, message: `已连通（${probe.model}）` };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function clearJevConfigAction(): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const {
+      getWorkflowRepository,
+      getCurrentAccountId,
+      JEV_API_KEY_SETTING_KEY,
+      JEV_BASE_URL_SETTING_KEY,
+      JEV_HEALTH_SETTING_KEY,
+      JEV_PREFILTER_ENABLED_SETTING_KEY,
+      JEV_PROBED_FOR_SETTING_KEY,
+      JEV_MODEL_SETTING_KEY,
+    } = await import("../lib/workflow-runtime");
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    for (const key of [JEV_API_KEY_SETTING_KEY, JEV_BASE_URL_SETTING_KEY, JEV_HEALTH_SETTING_KEY, JEV_PROBED_FOR_SETTING_KEY, JEV_MODEL_SETTING_KEY]) {
+      await repository.setAccountSetting(accountId, key, "");
+    }
+    // A blank account row means "inherit" (account → global): blanking `enabled` too
+    // would hand this account back to an instance-wide config that the worker keeps
+    // using while the form says 未配置. 清除 means this account's prefilter is off.
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `清除失败：${String(error)}` };
+  }
+}
+
+export async function setJevPrefilterEnabledAction(enabled: boolean): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, getCurrentAccountId, JEV_PREFILTER_ENABLED_SETTING_KEY } = await import(
+      "../lib/workflow-runtime"
+    );
+    const repository = getWorkflowRepository();
+    const accountId = await getCurrentAccountId();
+    await repository.setAccountSetting(accountId, JEV_PREFILTER_ENABLED_SETTING_KEY, enabled ? "1" : "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
 export async function testPushNotificationAction(
   settings: Record<string, string>,
 ): Promise<PushSettingsActionResult> {
@@ -850,11 +998,230 @@ export async function testRemoteAccessConnectionAction(): Promise<TestRemoteAcce
   // demo gate:与其它 settings action 一致(Copilot round 1)。
   // demo 站没有真实隧道,探测只会做无意义的跨网请求。
   assertNotDemo();
-  const { instanceConnectHostname } = await import("../lib/remote-access");
-  const hostname = instanceConnectHostname();
+  const { resolveInstanceConnectHostname } = await import("../lib/remote-access");
+  const hostname = await resolveInstanceConnectHostname();
   if (hostname === null) {
     return { ok: false, detail: "no_hostname" };
   }
   const { probeRemoteAccess } = await import("../lib/remote-access-probe");
   return await probeRemoteAccess(hostname);
+}
+
+// ── Agent memory (work detail page + Settings → AI 模型) ──────────────────────
+// Writes use requireAuthenticatedAccountId (like unbindStorageAction): an anonymous
+// remote caller resolves to the shared acct_unauthenticated sentinel, and must not be
+// able to change memory state for it. The throw lands in each action's catch → a
+// failed result, nothing written.
+type MemoryAddressInput = import("../lib/agent-memory-server").MemoryAddress;
+
+export async function setAgentMemoryEnabledAction(enabled: boolean): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const { AGENT_MEMORY_ENABLED_SETTING_KEY } = await import("../lib/agent-memory-server");
+    await getWorkflowRepository().setAccountSetting(await requireAuthenticatedAccountId(), AGENT_MEMORY_ENABLED_SETTING_KEY, enabled ? "1" : "0");
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `保存失败：${String(error)}` };
+  }
+}
+
+export async function deleteAgentMemoryAction(address: MemoryAddressInput, name: string): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const { deleteMemoryFromUi } = await import("../lib/agent-memory-server");
+    const result = await deleteMemoryFromUi(getWorkflowRepository(), await requireAuthenticatedAccountId(), address, name);
+    return result.success ? { success: true } : { success: false, message: result.message };
+  } catch (error) {
+    return { success: false, message: `删除没成功：${String(error)}` };
+  }
+}
+
+// ── User messages (work detail page) ─────────────────────────────────────────
+// One sentence asking the agent to replace bad episodes, or a bad film. Same guards and
+// result shape as the memory actions; the card refreshes the page itself afterwards, as
+// the notes panel does. The work-level actions file under resolveMessageWork's work,
+// the key the engine looks up — never a key derived from the page's storageId alone.
+const MESSAGE_NOT_TRACKED = "这部作品没有在这块网盘上追踪";
+const MESSAGE_ALREADY_TAKEN = "agent 已经开始处理这条留言了";
+
+interface MessageWorkInput {
+  tmdbId: number;
+  mediaType: "movie" | "tv";
+  // The page's workspace drive (undefined = primary), as for requestSeasonAction.
+  storageId: string | undefined;
+}
+
+/** The caller's work for this title on the page's drive (null when it is not tracked
+ *  there), and the page's workspace scope. Throws for an unauthenticated caller (→ the
+ *  action's catch). */
+async function messageWorkFor(input: MessageWorkInput) {
+  const { getActiveWorkspaceScope, getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+  const { resolveMessageWork } = await import("../lib/user-message-server");
+  await requireAuthenticatedAccountId();
+  const repo = getWorkflowRepository();
+  const scope = await getActiveWorkspaceScope(input.storageId);
+  return { repo, scope, work: await resolveMessageWork({ repo, scope, tmdbId: input.tmdbId, mediaType: input.mediaType }) };
+}
+
+/** The message as it will be stored (body trimmed), checked before any lookup: the
+ *  length limit applies to what is saved, and a bad message never costs a DB read.
+ *  Null message = valid. */
+async function checkMessageInput(input: { body: string; episodeTags: string[] }) {
+  const { validateUserMessageInput } = await import("@media-track/workflow");
+  // Whatever the client sent: only a string is trimmed, anything else goes to the validator as is.
+  const body = typeof input.body === "string" ? input.body.trim() : input.body;
+  return { body, message: validateUserMessageInput({ body, episodeTags: input.episodeTags }) };
+}
+
+export async function postUserMessageAction(
+  input: MessageWorkInput & { body: string; episodeTags: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    await repo.createUserMessage({ ...work, body: checked.body, episodeTags: input.episodeTags, now: new Date().toISOString() });
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `留言没发出去：${String(error)}` };
+  }
+}
+
+/** Only while the message waits; once a run holds it the store refuses. */
+export async function editUserMessageAction(input: { id: string; body: string; episodeTags: string[] }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const checked = await checkMessageInput(input);
+    if (checked.message) return { success: false, message: checked.message };
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const edited = await getWorkflowRepository().editUserMessage({
+      accountId,
+      id: input.id,
+      body: checked.body,
+      episodeTags: input.episodeTags,
+      now: new Date().toISOString(),
+    });
+    return edited ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `修改没成功：${String(error)}` };
+  }
+}
+
+export async function withdrawUserMessageAction(input: { id: string }): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { getWorkflowRepository, requireAuthenticatedAccountId } = await import("../lib/workflow-runtime");
+    const accountId = await requireAuthenticatedAccountId();
+    const withdrawn = await getWorkflowRepository().withdrawUserMessage({ accountId, id: input.id, now: new Date().toISOString() });
+    return withdrawn ? { success: true } : { success: false, message: MESSAGE_ALREADY_TAKEN };
+  } catch (error) {
+    return { success: false, message: `撤回没成功：${String(error)}` };
+  }
+}
+
+/** What 「现在处理」 did. "queued": a replace run is queued for the work's waiting
+ *  messages. "already_running": a run of this work is already queued or running — a
+ *  queued replace run takes the messages along when it starts, otherwise they go right
+ *  after the run in flight (the idle-queue scan), so the card says 「排队中 · 这次处理完
+ *  接着处理」. "nothing_waiting": claimed or withdrawn since the page loaded. */
+export type ProcessMessagesNowStatus = "queued" | "already_running" | "nothing_waiting";
+
+/** 「现在处理」: the work's waiting messages skip the patrol. */
+export async function processMessagesNowAction(
+  input: MessageWorkInput,
+): Promise<PushSettingsActionResult & { status?: ProcessMessagesNowStatus }> {
+  assertNotDemo();
+  try {
+    const { repo, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    // Like every acquire entry point: never queue a run that can only fail in the worker.
+    const preflight = await acquireLlmNotConfigured();
+    if (preflight) return { success: false, message: preflight.message };
+    const drive = (await repo.listConnectedStorages(work.accountId)).find((s) => s.id === work.drive);
+    if (drive?.status === "frozen") return { success: false, message: "这块网盘登录已失效，重新绑定后再处理" };
+    const { queueReplaceRequest } = await import("@media-track/workflow");
+    if ((await repo.markUserMessagesUrgent({ ...work, now: new Date().toISOString() })) === 0) {
+      return { success: true, status: "nothing_waiting" };
+    }
+    const result = await queueReplaceRequest({ repository: repo, work, origin: "user" });
+    if (result.status === "not_tracked") return { success: false, message: MESSAGE_NOT_TRACKED };
+    return { success: true, status: result.status };
+  } catch (error) {
+    return { success: false, message: `没能开始处理：${String(error)}` };
+  }
+}
+
+/** 「不换了」: these episodes stay as they are; the patrol stops looking for them. Saved at
+ *  once — the card's 撤销 calls restoreEpisodesToPendingAction. Refused while a replace run
+ *  of the work is processing, as the card's button is — checked again here, since the page
+ *  may not have seen the run start. */
+export async function keepEpisodesAsIsAction(
+  input: MessageWorkInput & { episodes: string[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const { repo, scope, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    const { episodes } = input;
+    if (!Array.isArray(episodes) || episodes.length > USER_MESSAGE_LIMITS.tagsMax || episodes.some((e) => typeof e !== "string")) {
+      return { success: false, message: "集数不对" };
+    }
+    const { keepMustWait } = await import("../lib/user-message-server");
+    if (await keepMustWait({ repo, scope, work })) {
+      const { KEEP_BUSY_HINT } = await import("../lib/user-message-state");
+      return { success: false, message: KEEP_BUSY_HINT };
+    }
+    await repo.removePendingReplacements({ ...work, episodes });
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能保存：${String(error)}` };
+  }
+}
+
+/** A 待换 row as the card got it (loadMessageThread): what 撤销 puts back. */
+export interface PendingEpisodeInput {
+  episode: string;
+  messageId: string;
+  requestedAt: string;
+}
+
+/** 撤销 after 「不换了」: the 待换 rows go back exactly as they were (the message that asked,
+ *  and when), so the patrol looks for these episodes again. A row that is somehow still
+ *  there is left alone. Only rows this work's own 待换 could have held are taken — its own
+ *  messages, its own episodes, no future time — and one that is not refuses the whole call. */
+export async function restoreEpisodesToPendingAction(
+  input: MessageWorkInput & { episodes: PendingEpisodeInput[] },
+): Promise<PushSettingsActionResult> {
+  assertNotDemo();
+  try {
+    const { USER_MESSAGE_LIMITS } = await import("@media-track/workflow");
+    const { parsePendingRows, pendingRowsFitWork } = await import("../lib/user-message-server");
+    const rows = parsePendingRows(input.episodes, input.mediaType, USER_MESSAGE_LIMITS.tagsMax);
+    if (!rows) return { success: false, message: "集数不对" };
+    const { repo, scope, work } = await messageWorkFor(input);
+    if (!work) return { success: false, message: MESSAGE_NOT_TRACKED };
+    if (!(await pendingRowsFitWork({ repo, scope, work, mediaType: input.mediaType, rows, now: new Date() }))) {
+      return { success: false, message: "要恢复的集对不上这部作品" };
+    }
+    // addPendingReplacements takes one message and one time per call.
+    const groups = new Map<string, { messageId: string; requestedAt: string; episodes: string[] }>();
+    for (const row of rows) {
+      const key = `${row.messageId} ${row.requestedAt}`;
+      const group = groups.get(key) ?? { messageId: row.messageId, requestedAt: row.requestedAt, episodes: [] };
+      group.episodes.push(row.episode);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      await repo.addPendingReplacements({ ...work, episodes: group.episodes, messageId: group.messageId, now: group.requestedAt });
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, message: `没能撤销：${String(error)}` };
+  }
 }

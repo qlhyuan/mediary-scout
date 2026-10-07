@@ -15,6 +15,11 @@ import type { MergedSourceHealth } from "../resource-source-health.js";
 export interface SimResourceCandidate {
   id: string;
   title: string;
+  /** PanSou post date (YYYY-MM-DD) when the provider actually has one. A share
+   *  posted before the missing episode aired almost certainly does not contain it. */
+  postedAt?: string;
+  /** This work's own transfers of the same link over the last 30 days. */
+  linkHistory?: string;
 }
 
 export interface ResourceSnapshotV2 {
@@ -27,6 +32,11 @@ export interface ResourceSnapshotV2 {
    *  在 candidates 层面完全同形（都是空数组）。丢掉它，agent 就只能上报
    *  reportNoCoverage，用户看到「暂未找到可用资源」，系统故障被甩锅给资源。 */
   sourceHealth?: MergedSourceHealth;
+  /** candidateId → Jev P(refers to target), only when a prefilter ran. The sandbox
+   *  renders the uncertain band as ⚠ 相关度存疑 so the agent knows where to look twice. */
+  prefilterScores?: Record<string, number>;
+  /** How many candidates the prefilter removed from this search (only when it ran). */
+  prefilterDropped?: number;
 }
 
 /** The provider surface the sandbox depends on — the fake and the real PanSou
