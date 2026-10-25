@@ -22,7 +22,18 @@ import {
 import { isTransientAcquisitionError } from "./acquisition-v2/transient-error.js";
 import type { JevJudge } from "./jev-judge.js";
 import { stagingFailureAuditEvents } from "./acquisition-v2/directory-lifecycle.js";
-import { describeAgentRunError, summarizeErrorForNotification } from "./agent-error.js";
+import { hasTransferAttemptedOnThrow } from "./acquisition-v2/orchestrator.js";
+import {
+  describeAgentRunError,
+  isLlmAuthError,
+  isLlmHttpStatusError,
+  isLlmModelGoneError,
+  isLlmRateLimitError,
+  isLlmServerError,
+  summarizeErrorForNotification,
+} from "./agent-error.js";
+import { isFreeLlmPreset } from "./agent-model.js";
+import type { TitleResearchOptions } from "./acquisition-v2/title-research.js";
 import { formatReportPushText } from "./notification-report.js";
 import { isMovieUnreleased } from "./domain.js";
 import {
@@ -91,12 +102,14 @@ export async function resolveWorkerDeps(
   storage: StorageExecutor;
   resourceProvider: ResourceProvider;
   model: LanguageModel;
+  llmConfig: { baseURL?: string; modelId?: string } | undefined;
   preferredLanguage: string | undefined;
   qualityPreference: "high" | "medium" | undefined;
   storageProvider: string | undefined;
   assrtToken: string | undefined;
   jevJudge: JevJudge | undefined;
   agentMemory: boolean | undefined;
+  titleResearch: TitleResearchOptions | undefined;
   storageParentDirectoryId: string | undefined;
   animeStorageParentDirectoryId: string | undefined;
   moviesParentDirectoryId: string | undefined;
@@ -106,6 +119,11 @@ export async function resolveWorkerDeps(
     storage: ctx.storage ?? base.storage,
     resourceProvider: ctx.resourceProvider ?? base.resourceProvider,
     model: ctx.model ?? base.model,
+    // The failure-copy config must describe the model THIS run actually uses.
+    // The resolver's model wins only when it discloses its config; a resolver
+    // that overrides the model without llmConfig yields undefined → the worker
+    // falls back to the AGNOSTIC copy (never guess a config it cannot see).
+    llmConfig: ctx.model !== undefined ? ctx.llmConfig : base.llmConfig,
     preferredLanguage: ctx.preferredLanguage ?? base.preferredLanguage,
     qualityPreference: ctx.qualityPreference ?? base.qualityPreference,
     storageProvider: ctx.storageProvider ?? base.storageProvider,
@@ -115,6 +133,10 @@ export async function resolveWorkerDeps(
     // prefilter must not inherit a judge that happens to ride in the base deps.
     jevJudge: resolve ? ctx.jevJudge : base.jevJudge,
     agentMemory: ctx.agentMemory ?? base.agentMemory,
+    // Web search follows the account's LLM endpoint (DeepSeek's own engine when
+    // that is what they configured). With a resolver its answer is authoritative
+    // — an account without one must not inherit another account's config.
+    titleResearch: resolve ? ctx.titleResearch : base.titleResearch,
     storageParentDirectoryId:
       ctx.storageParentDirectoryId ?? base.storageParentDirectoryId,
     animeStorageParentDirectoryId:
@@ -151,6 +173,12 @@ export interface AccountWorkerContext {
   storage?: StorageExecutor;
   resourceProvider?: ResourceProvider;
   model?: LanguageModel;
+  /** The config (baseURL/modelId only, never the key) that built `model`.
+   *  Informational: the worker consults it only for free-preset-gated
+   *  presentation/recovery (isFreeLlmPreset — failure copy, and the HTTP-status
+   *  transient layer of the free pool's backoff, Copilot r5 M) — it never
+   *  affects execution. Absent → agnostic copy. */
+  llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
   /** The run's drive brand ("pan115" | "quark") — selects brand-specific skill. */
@@ -161,6 +189,8 @@ export interface AccountWorkerContext {
   jevJudge?: JevJudge;
   /** Agent memory on/off, resolved per account from Settings (absent = on). */
   agentMemory?: boolean;
+  /** Web-reference tools, resolved from the account's LLM endpoint. */
+  titleResearch?: TitleResearchOptions;
   storageParentDirectoryId?: string;
   animeStorageParentDirectoryId?: string;
   moviesParentDirectoryId?: string;
@@ -211,6 +241,64 @@ function failureReport(
   };
 }
 
+/** 免费档（isFreeLlmPreset）下 LLM 调用类失败的首行文案。逐字固定（含全角
+ *  标点）—— 改动要走设计复核。只在「当前生效配置 == 出厂免费预设 且错误能
+ *  明确识别为 LLM 调用失败（限流/鉴权/5xx）」时替换 agnostic 的「获取失败」
+ *  首行；自带模型的用户永远看到 agnostic 文案（不点名任何厂商）。 */
+export const FREE_LLM_POOL_FAILURE_LINE =
+  "AI 模型调用失败：Kilo 公共免费池暂时不可用（限速或服务波动）。可稍后重试，或在 设置 → AI 模型 换成自己的服务。";
+
+/** 免费档下「模型下架」（model not found 类）的首行文案。模型没了重试也不会
+ *  好，所以它不是 transient（不退避重排）、直接终止并指引用户换模型。 */
+export const FREE_LLM_MODEL_GONE_LINE =
+  "内置免费模型已失效（Kilo 池变动）。请到 设置 → AI 模型 换一个模型或换成自己的服务。";
+
+/**
+ * 首行失败标题：免费档 + 可明确识别的 LLM 调用失败 → 点名 Kilo 的可操作文案；
+ *  其余一切（自带模型、非 LLM 错误、识别不了的）→ 现有 agnostic 文案。口径
+ *  保守：分类器（isLlm*Error）都带非-LLM 上游（网盘品牌/PanSou/Prowlarr）短路，
+ *  网盘错/搜索源错绝不冒充「Kilo 挂了」。auth(401/403) 也归入「池不可用」：
+ *  免费预设不带 key，从 Kilo 回 401/403 只能是池侧访问策略变了，agnostic 的
+ *  「检查 API Key」指引对没配过 key 的免费档用户是误导。
+ */
+function failureHeadline(input: {
+  error: unknown;
+  llmConfig: { baseURL?: string; modelId?: string } | undefined;
+}): string | null {
+  if (!isFreeLlmPreset(input.llmConfig ?? {})) {
+    return null;
+  }
+  if (isLlmModelGoneError(input.error)) {
+    return FREE_LLM_MODEL_GONE_LINE;
+  }
+  if (
+    isLlmRateLimitError(input.error) ||
+    isLlmAuthError(input.error) ||
+    isLlmServerError(input.error)
+  ) {
+    return FREE_LLM_POOL_FAILURE_LINE;
+  }
+  return null;
+}
+
+function isTransientForRun(
+  error: unknown,
+  llmConfig: { baseURL?: string; modelId?: string } | undefined,
+): boolean {
+  const httpStatusClassified =
+    isFreeLlmPreset(llmConfig ?? {}) &&
+    (isLlmModelGoneError(error) ||
+      isLlmRateLimitError(error) ||
+      isLlmAuthError(error) ||
+      isLlmServerError(error) ||
+      isLlmHttpStatusError(error));
+  return isTransientAcquisitionError(
+    error,
+    0,
+    httpStatusClassified ? { httpStatusClassified: true } : undefined,
+  );
+}
+
 /**
  * Single failure path for every interactive queued acquisition (type2/series/
  * movie). A TRANSIENT error (network/TLS/socket — see isTransientAcquisitionError)
@@ -229,6 +317,12 @@ export async function handleWorkflowRunFailure(input: {
    *  A patrol-origin replace run passes "scheduled" so its failure joins the daily digest,
    *  matching the success path (stampReplaceNotification). */
   notificationTrigger?: "user" | "scheduled";
+  /** The effective LLM config of the model THIS run used (base or per-account
+   *  resolver). Consulted ONLY for free-preset-gated presentation/recovery — the
+   *  failure copy (isFreeLlmPreset) and the HTTP-status transient layer (429/5xx
+   *  backoff is the free pool's recovery strategy, Copilot r5 M); never affects
+   *  execution. Absent → agnostic copy + legacy connection-class transient. */
+  llmConfig?: { baseURL?: string; modelId?: string };
 }): Promise<{ status: "auto_requeued" | "failed"; workflowRunId: string; errorMessage: string }> {
   const { claimed, error, repository } = input;
   const nowIso = input.now();
@@ -239,7 +333,18 @@ export async function handleWorkflowRunFailure(input: {
   // any logging stay accurate.
   const errorMessage = describeAgentRunError(error);
   const priorCount = claimed.workflowRun.autoRequeueCount ?? 0;
-  const transient = isTransientAcquisitionError(error);
+  // HTTP 状态类退避（429/5xx）是免费池专属恢复策略（spec：已配置 DB/env 的
+  // 用户行为不变）：仅当「当前生效配置 == 出厂免费预设（isFreeLlmPreset）且
+  // 错误能明确识别为 LLM 调用失败」时，才让 transient 判定追加 HTTP 状态类
+  // 匹配。识别 = agent-error.ts 的 isLlm* 分类器任一命中，**或**
+  // isLlmHttpStatusError —— message-only 的状态形态（"Request failed with
+  // status code 429" / "HTTP 520 from gateway"，isLlm* 的短语/数值分类器
+  // 刻意不认裸数字）与 transient 层（开关打开后）实际匹配的形态同源
+  // （nodeCarriesHttpStatusShape），保证门控不再比被门控的能力窄（Copilot
+  // r6 M）。非 LLM 排除保留：网盘/PanSou/Prowlarr 的 429/5xx 不因此进门，
+  // BYO 维持既有保守连接类分类 —— Kilo 免费池的恢复策略不扩大到别人的
+  // 失败上（Copilot r5 M）。
+  const transient = isTransientForRun(error, input.llmConfig);
   const willRetry = transient && priorCount < AUTO_REQUEUE_MAX;
 
   // A staging dir that survived the harness cleanup on this failed body rides on
@@ -265,8 +370,11 @@ export async function handleWorkflowRunFailure(input: {
     ]);
   } else {
     workflowRun = failWorkflowRun(claimedRun, errorMessage, nowIso);
+    // 免费档 + 可明确识别的 LLM 调用失败 → 首行换成点名 Kilo 的指引；其余
+    // （含重试耗尽的网络中断）保持 agnostic 现状。
+    const headline = failureHeadline({ error, llmConfig: input.llmConfig });
     report = failureReport(claimed, "failed", [
-      transient ? `网络中断,已自动重试 ${priorCount} 次仍失败` : "获取失败",
+      headline ?? (transient ? `网络中断,已自动重试 ${priorCount} 次仍失败` : "获取失败"),
       // Pushed verbatim by formatReportPushText, so the same redaction as the retry
       // line; the raw message stays in the run row (failWorkflowRun) for forensics.
       summarizeErrorForNotification(errorMessage),
@@ -340,8 +448,12 @@ export async function runQueuedType2Workflow(input: {
   resourceProvider: ResourceProvider;
   storage: StorageExecutor;
   model: LanguageModel;
+  /** Config that built `model` (failure-copy only — see AccountWorkerContext.llmConfig). */
+  llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  /** Web-reference tools for the agent (see TitleResearchOptions). */
+  titleResearch?: TitleResearchOptions;
   now?: () => string;
   storageParentDirectoryId?: string;
   /** Separate landing parent for anime (see runQueuedSeriesInitialization). */
@@ -361,6 +473,9 @@ export async function runQueuedType2Workflow(input: {
   if (!claimed) {
     return { status: "idle" };
   }
+  // The config of the model this run ENDED UP using (per-account resolver may
+  // override the base) — captured for the failure handler's free-tier copy.
+  let resolvedLlmConfig: { baseURL?: string; modelId?: string } | undefined;
   // Inside the try: a throw here (drive gone, settings cleared, a DB blip) must end the
   // claimed run through the failure handler, not leave it "running".
   try {
@@ -370,6 +485,7 @@ export async function runQueuedType2Workflow(input: {
       claimed.connectedStorageId,
       input,
     );
+    resolvedLlmConfig = deps.llmConfig;
     const result = await runType2InitializationV2AndPersist({
       title: claimed.title,
       season: claimed.season,
@@ -404,6 +520,10 @@ export async function runQueuedType2Workflow(input: {
       ...(deps.agentMemory === undefined
         ? {}
         : { agentMemory: deps.agentMemory }),
+        // Web-reference tools, same per-account resolution as memory.
+        ...(deps.titleResearch === undefined
+          ? {}
+          : { titleResearch: deps.titleResearch }),
       // finishedAt is stamped post-run inside the persist step (see runner-v2),
       // so it reflects actual completion, not the claim time.
       workflowRun: {
@@ -425,6 +545,7 @@ export async function runQueuedType2Workflow(input: {
       error,
       repository: input.repository,
       now,
+      ...(resolvedLlmConfig === undefined ? {} : { llmConfig: resolvedLlmConfig }),
       ...(input.onAuthErrorFreeze === undefined
         ? {}
         : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
@@ -469,8 +590,12 @@ export async function runScheduledType3Monitoring(input: {
   resourceProvider: ResourceProvider;
   storage: StorageExecutor;
   model: LanguageModel;
+  /** Config that built `model` (used for free-preset HTTP-status transient classification). */
+  llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  /** Web-reference tools for the agent (see TitleResearchOptions). */
+  titleResearch?: TitleResearchOptions;
   storageParentDirectoryId: string;
   /** Separate landing parent for anime, so anime patrol verify-or-creates under
    *  its own tree (see runQueuedSeriesInitialization). */
@@ -710,8 +835,8 @@ async function patrolTrackedState(args: {
       return { trackedSeasonId: season.id, status: "skipped_active" };
     }
 
-    try {
-      const result = await runType3MonitoringV2AndPersist({
+    const runOnce = () =>
+      runType3MonitoringV2AndPersist({
         title: state.title,
         season,
         episodes,
@@ -746,9 +871,28 @@ async function patrolTrackedState(args: {
         ...(deps.agentMemory === undefined
           ? {}
           : { agentMemory: deps.agentMemory }),
+          // Web-reference tools, same per-account resolution as memory.
+          ...(deps.titleResearch === undefined
+            ? {}
+            : { titleResearch: deps.titleResearch }),
         workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
         now,
       });
+
+    try {
+      let result;
+      try {
+        result = await runOnce();
+      } catch (firstError) {
+        if (
+          !isTransientForRun(firstError, deps.llmConfig) ||
+          stagingFailureAuditEvents(firstError).length > 0 ||
+          hasTransferAttemptedOnThrow(firstError)
+        ) {
+          throw firstError;
+        }
+        result = await runOnce();
+      }
       return {
         trackedSeasonId: state.season.id,
         status: "ran",
@@ -758,6 +902,10 @@ async function patrolTrackedState(args: {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Workflow failed";
+      console.log(
+        `[workflow] run ${workflowRunId} type3_monitor failed` +
+          ` (storage ${state.connectedStorageId ?? "-"}): ${summarizeErrorForNotification(errorMessage)}`,
+      );
       await input.repository.saveWorkflowRunSnapshot({
         accountId: state.accountId,
         connectedStorageId: state.connectedStorageId,
@@ -819,12 +967,14 @@ async function patrolMovie(args: {
     resourceProvider: ResourceProvider;
     storage: StorageExecutor;
     model: LanguageModel;
+    llmConfig: { baseURL?: string; modelId?: string } | undefined;
     preferredLanguage: string | undefined;
     qualityPreference: "high" | "medium" | undefined;
     storageProvider: string | undefined;
     assrtToken: string | undefined;
     jevJudge: JevJudge | undefined;
     agentMemory: boolean | undefined;
+    titleResearch: TitleResearchOptions | undefined;
     moviesParentDirectoryId: string | undefined;
   };
   state: {
@@ -900,8 +1050,8 @@ async function patrolMovie(args: {
     return { trackedSeasonId: state.season.id, status: "skipped_active" };
   }
 
-  try {
-    const result = await runMovieAcquisitionV2AndPersist({
+  const runOnce = () =>
+    runMovieAcquisitionV2AndPersist({
       title: state.title,
       categoryParentId: moviesParent,
       resourceProvider: deps.resourceProvider,
@@ -928,11 +1078,30 @@ async function patrolMovie(args: {
       ...(deps.agentMemory === undefined
         ? {}
         : { agentMemory: deps.agentMemory }),
+        // Web-reference tools, same per-account resolution as memory.
+        ...(deps.titleResearch === undefined
+          ? {}
+          : { titleResearch: deps.titleResearch }),
       // Reported in the sweep's daily digest, like the shows, not pushed on its own.
       notice: { trigger: "scheduled", routineIfNothingReplaced: false },
       workflowRun: { id: workflowRunId, startedAt, finishedAt: null },
       now,
     });
+
+  try {
+    let result;
+    try {
+      result = await runOnce();
+    } catch (firstError) {
+      if (
+        !isTransientForRun(firstError, deps.llmConfig) ||
+        stagingFailureAuditEvents(firstError).length > 0 ||
+        hasTransferAttemptedOnThrow(firstError)
+      ) {
+        throw firstError;
+      }
+      result = await runOnce();
+    }
     return {
       trackedSeasonId: state.season.id,
       status: "ran",
@@ -942,6 +1111,10 @@ async function patrolMovie(args: {
   } catch (error) {
     const errorMessage =
       error instanceof Error ? error.message : "Workflow failed";
+    console.log(
+      `[workflow] run ${workflowRunId} movie_init failed` +
+        ` (storage ${state.connectedStorageId ?? "-"}): ${summarizeErrorForNotification(errorMessage)}`,
+    );
     await input.repository.saveWorkflowRunSnapshot({
       accountId: state.accountId,
       connectedStorageId: state.connectedStorageId,
@@ -1021,8 +1194,12 @@ export async function runQueuedMovieAcquisition(input: {
   resourceProvider: ResourceProvider;
   storage: StorageExecutor;
   model: LanguageModel;
+  /** Config that built `model` (failure-copy only — see AccountWorkerContext.llmConfig). */
+  llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  /** Web-reference tools for the agent (see TitleResearchOptions). */
+  titleResearch?: TitleResearchOptions;
   moviesParentDirectoryId: string;
   now?: () => string;
   /** §7: resolve the claimed run's per-account 115 creds + landing CIDs. */
@@ -1040,6 +1217,8 @@ export async function runQueuedMovieAcquisition(input: {
   if (!claimed) {
     return { status: "idle" };
   }
+  // As in runQueuedType2Workflow: the config of the model this run ended up using.
+  let resolvedLlmConfig: { baseURL?: string; modelId?: string } | undefined;
   // Inside the try: a throw here (drive gone, settings cleared, a DB blip) must end the
   // claimed run through the failure handler, not leave it "running".
   try {
@@ -1049,6 +1228,7 @@ export async function runQueuedMovieAcquisition(input: {
       claimed.connectedStorageId,
       input,
     );
+    resolvedLlmConfig = deps.llmConfig;
     const result = await runMovieAcquisitionV2AndPersist({
       title: claimed.title,
       categoryParentId:
@@ -1077,6 +1257,10 @@ export async function runQueuedMovieAcquisition(input: {
       ...(deps.agentMemory === undefined
         ? {}
         : { agentMemory: deps.agentMemory }),
+        // Web-reference tools, same per-account resolution as memory.
+        ...(deps.titleResearch === undefined
+          ? {}
+          : { titleResearch: deps.titleResearch }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,
@@ -1095,6 +1279,7 @@ export async function runQueuedMovieAcquisition(input: {
       error,
       repository: input.repository,
       now,
+      ...(resolvedLlmConfig === undefined ? {} : { llmConfig: resolvedLlmConfig }),
       ...(input.onAuthErrorFreeze === undefined
         ? {}
         : { onAuthErrorFreeze: input.onAuthErrorFreeze }),
@@ -1110,8 +1295,12 @@ export async function runQueuedSeriesInitialization(input: {
   resourceProvider: ResourceProvider;
   storage: StorageExecutor;
   model: LanguageModel;
+  /** Config that built `model` (failure-copy only — see AccountWorkerContext.llmConfig). */
+  llmConfig?: { baseURL?: string; modelId?: string };
   preferredLanguage?: string;
   qualityPreference?: "high" | "medium";
+  /** Web-reference tools for the agent (see TitleResearchOptions). */
+  titleResearch?: TitleResearchOptions;
   storageParentDirectoryId: string;
   /** Separate landing parent for anime, so the 动漫 shelf is physically its own
    *  tree on 115 and never mixed into the TV shows directory. */
@@ -1138,6 +1327,8 @@ export async function runQueuedSeriesInitialization(input: {
   const seasons = (queuedEvent?.data?.["seasons"] ??
     []) as AcquisitionSeasonScope[];
 
+  // As in runQueuedType2Workflow: the config of the model this run ended up using.
+  let resolvedLlmConfig: { baseURL?: string; modelId?: string } | undefined;
   // Inside the try, as in the other queued runners.
   try {
     const deps = await resolveWorkerDeps(
@@ -1146,6 +1337,7 @@ export async function runQueuedSeriesInitialization(input: {
       claimed.connectedStorageId,
       input,
     );
+    resolvedLlmConfig = deps.llmConfig;
     if (seasons.length === 0) {
       throw new Error(
         "Queued series initialization run is missing its season metadata",
@@ -1186,6 +1378,10 @@ export async function runQueuedSeriesInitialization(input: {
       ...(deps.agentMemory === undefined
         ? {}
         : { agentMemory: deps.agentMemory }),
+        // Web-reference tools, same per-account resolution as memory.
+        ...(deps.titleResearch === undefined
+          ? {}
+          : { titleResearch: deps.titleResearch }),
       workflowRun: {
         id: claimed.workflowRun.id,
         startedAt: claimed.workflowRun.startedAt,
@@ -1227,6 +1423,7 @@ export async function runQueuedSeriesInitialization(input: {
       error,
       repository: input.repository,
       now,
+      ...(resolvedLlmConfig === undefined ? {} : { llmConfig: resolvedLlmConfig }),
       ...(input.onAuthErrorFreeze === undefined
         ? {}
         : { onAuthErrorFreeze: input.onAuthErrorFreeze }),

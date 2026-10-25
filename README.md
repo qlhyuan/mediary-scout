@@ -20,7 +20,7 @@
   <a href="README.en.md">English</a>
 </p>
 
-你说要哪部电影、剧或番，agent 自己去搜资源，挑最合适的转存进你自己的网盘（夸克 / 115 / 光鸭 / 123 / 天翼），转完读回来确认真的到了，之后缺哪集还会接着补。
+你说要哪部电影、剧或番，agent 自己去搜资源，挑最合适的转存进你自己的网盘（夸克 / UC / 115 / 光鸭 / 123 / 天翼），转完读回来确认真的到了，之后缺哪集还会接着补。
 
 点击前往下载：[GitHub Releases](https://github.com/fancydirty/mediary-scout/releases/latest)（macOS / Windows 桌面版）
 
@@ -57,7 +57,7 @@ docker compose up -d
 | 多用户 | 不支持 | 支持 |
 | 手机、出门访问 | 仅本机 | Tailscale / Cloudflare Tunnel |
 
-两种都要自带一个 OpenAI 兼容的 AI 模型接口（key 只存在你自己的实例里）。影视信息开箱即用。资源搜索用 PanSou：Docker 版自带一个，桌面版默认用公共实例，可以在设置里换成你自己的；可选再接 Prowlarr 找磁力。
+两种形态下，自带 OpenAI 兼容的 AI 模型接口都是可选升级（key 只存在你自己的实例里）。未配置 AI 模型时，默认使用 Kilo Code 的公共免费模型池（无需注册；获取任务的对话上下文——搜索查询、任务与留言内容、候选结果、文件名等——会发送给 Kilo 及其上游模型提供商）。影视信息开箱即用。资源搜索用 PanSou：Docker 版自带一个，桌面版默认用公共实例，可以在设置里换成你自己的；可选再接 Prowlarr 找磁力。
 
 ## 支持的网盘
 
@@ -73,11 +73,12 @@ docker compose up -d
 
 - [部署指南](docs/deploy.md)
 - [Agent API](docs/agent-api.md)：让 Claude Code、Codex 等编程 agent 直接操作巡影
+- [搜索与网页查证](docs/web-research.md)：描述也能找片；官方不分季的作品怎么对集号
 - [架构速览](docs/architecture.md)
 
 ## 免责声明
 
-巡影是开源、自部署的软件，不提供、也永远不会提供托管服务：你自己跑实例，自带网盘和 AI 模型的凭证。它做的就是你本可以在自己网盘里手动完成的那些文件操作。详见[项目定位](docs/distribution-and-legal-positioning.md)。与 115、夸克、光鸭、123、天翼、TMDB 及任何索引器均无隶属关系。
+巡影是开源、自部署的软件，不提供、也永远不会提供托管服务：你自己跑实例，自带网盘和 AI 模型的凭证。它做的就是你本可以在自己网盘里手动完成的那些文件操作。详见[项目定位](docs/distribution-and-legal-positioning.md)。与 115、夸克、UC、光鸭、123、天翼、TMDB 及任何索引器均无隶属关系。
 
 ## 致谢
 

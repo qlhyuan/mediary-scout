@@ -55,6 +55,8 @@ export interface RunAcquisitionV2Request {
   /** Movie: the single scoped movie directory this task may write into. */
   targetMovieDirectoryId?: string;
   searchBudget?: number;
+  /** 预搜退避重试的等待毫秒数(sandbox 默认 PRESEARCH_RETRY_DELAY_MS)。测试注入 0。 */
+  presearchRetryDelayMs?: number;
   maxSteps?: number;
   preferredLanguage?: string;
   /** TMDB origin_country of the title — when it includes CN the movie prompt skips
@@ -118,6 +120,12 @@ export interface RunAcquisitionV2Request {
   linkHistory?: { list: () => Promise<LinkHistoryRow[]> };
   /** Leftover staging: no search, no transfer, no memory reflection. Season files stay protected. */
   stagingRecovery?: boolean;
+  /** Web-reference tools for the agent: alternate titles, and mapping a fan
+   *  season/story-arc name onto this task's absolute episode numbers on shows
+   *  their rights holder never split. Carries the user's LLM endpoint so the
+   *  search routes through DeepSeek's own engine when that is what they use.
+   *  Absent = no web access (and no fan-season block in the prompt). */
+  titleResearch?: { web: { llmBaseURL?: string; llmApiKey?: string; timeoutMs?: number; limit?: number } };
   /** A replace_request run (user message). See docs/superpowers/specs/2026-09-26-user-message-replace-design.md. */
   userRequest?: {
     /** Episodes the user named or that are still pending (movie: ["MOVIE"]). Added to the need. */
@@ -209,6 +217,27 @@ function rejectionRowItems<T extends { episode: string; isVideo: boolean }>(item
     rows.push(...(videos.length > 0 ? videos : group));
   }
   return rows;
+}
+
+const TRANSFER_ATTEMPTED_ON_THROW = Symbol.for("media-track.transferAttemptedOnThrow");
+
+export function attachTransferAttemptedOnThrow<E>(error: E, attempted: boolean): E {
+  if (attempted && typeof error === "object" && error !== null) {
+    Object.defineProperty(error, TRANSFER_ATTEMPTED_ON_THROW, {
+      value: true,
+      enumerable: false,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return error;
+}
+
+export function hasTransferAttemptedOnThrow(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  return (error as Record<symbol, unknown>)[TRANSFER_ATTEMPTED_ON_THROW] === true;
 }
 
 export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promise<RunAcquisitionV2Result> {
@@ -329,6 +358,9 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     // fallbacks ("2026 电影") at the tool boundary so they never burn a search.
     titleTerms: [request.target.title, ...request.target.aliases],
     ...(request.searchBudget === undefined ? {} : { searchBudget: request.searchBudget }),
+    ...(request.presearchRetryDelayMs === undefined
+      ? {}
+      : { presearchRetryDelayMs: request.presearchRetryDelayMs }),
     ...(request.searchProfile === undefined ? {} : { searchProfile: request.searchProfile }),
     ...(memoryBinding ? { memory: memoryBinding } : {}),
     ...(protectExisting ? { protectExistingFiles: true } : {}),
@@ -589,12 +621,19 @@ export async function runAcquisitionV2(request: RunAcquisitionV2Request): Promis
     ...(userRequest ? { userRequests: userRequest.prompt } : {}),
     ...(protectExisting ? { protectExisting } : {}),
     ...(request.stagingRecovery ? { stagingRecovery: true as const } : {}),
+    ...(request.titleResearch === undefined ? {} : { titleResearch: request.titleResearch }),
   };
 
-  const result =
-    request.target.kind === "tv"
-      ? await runTvAnimeTaskAgent({ ...common, target: stripKind(request.target) })
-      : await runMovieTaskAgent({ ...common, target: stripKind(request.target) });
+  let result: AcquisitionAgentResult;
+  try {
+    result =
+      request.target.kind === "tv"
+        ? await runTvAnimeTaskAgent({ ...common, target: stripKind(request.target) })
+        : await runMovieTaskAgent({ ...common, target: stripKind(request.target) });
+  } catch (error) {
+    const attempted = storage.attempts().length > 0 || (await sandbox.hasTransferEvidence());
+    throw attachTransferAttemptedOnThrow(error, attempted);
+  }
   // Every requested/rejected episode the agent did not report becomes not_found
   // (stays 待换). After the loop — the content-filter recovery turn included.
   if (userRequest) await sandbox.finalizeReplacement();
