@@ -1,18 +1,19 @@
-import { DEFAULT_ACCOUNT_ID } from "./domain.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  type AcquisitionSeasonScope,
+  type AuditEvent,
+  type EpisodeCopy,
+  type EpisodeState,
+  type MediaTitle,
+  type NotificationEvent,
+  type TrackedSeason,
+  type WorkflowKind,
+  type WorkflowRun,
+  type WorkflowRunMetadata,
+  type WorkflowStatus,
+} from "./domain.js";
 import type { AgentMemoryStore } from "./agent-memory.js";
 import type { LanguageModel } from "ai";
-import type {
-  AcquisitionSeasonScope,
-  AuditEvent,
-  EpisodeState,
-  MediaTitle,
-  NotificationEvent,
-  TrackedSeason,
-  WorkflowKind,
-  WorkflowRun,
-  WorkflowRunMetadata,
-  WorkflowStatus,
-} from "./domain.js";
 import { runTvAcquisitionV2, type RunTvAcquisitionV2Request } from "./acquisition-v2/run-tv-v2.js";
 import type { TitleResearchOptions } from "./acquisition-v2/title-research.js";
 import type { BridgedV2Result } from "./acquisition-v2/workflow-v2-bridge.js";
@@ -20,10 +21,10 @@ import { makeProgressSink } from "./acquisition-v2/progress-sink.js";
 import { makeAgentTraceSink, combineToolEventSinks } from "./acquisition-v2/agent-trace-sink.js";
 import { runMovieAcquisitionV2, type MovieAcquisitionV2Result, type RunMovieAcquisitionV2Request } from "./movie-workflow-v2.js";
 import type { JevJudge } from "./jev-judge.js";
-import type { ResourceProvider, StorageExecutor } from "./ports.js";
+import type { AcquisitionDriveContext, ResourceProvider, StorageExecutor } from "./ports.js";
 import type { PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repository.js";
 import { userMessageDrive } from "./user-requests.js";
-import { stampReplaceNotification } from "./notification-report.js";
+import { formatReportPushText, stampReplaceNotification } from "./notification-report.js";
 
 /**
  * Phase 7d — production persist wrappers on the V2 engine. These mirror the old
@@ -64,6 +65,8 @@ interface TvV2Common {
   agentMemory?: boolean;
   /** Web-reference tools (alternate titles, fan-season ↔ TMDB episode mapping). */
   titleResearch?: TitleResearchOptions;
+  /** Ordered active drives for this account in unified multi-drive mode. */
+  drives?: AcquisitionDriveContext[];
   /**
    * Wall clock for the run. Drives the engine's timestamps (including the
    * terminal notification's `createdAt`) AND the persisted `finishedAt`, which
@@ -90,6 +93,7 @@ function passthrough(input: TvV2Common): {
   jevJudge?: JevJudge;
   memory?: { store: AgentMemoryStore; accountId: string; drive?: string };
   titleResearch?: TitleResearchOptions;
+  drives?: AcquisitionDriveContext[];
 } {
   return {
     ...memoryOption(input),
@@ -101,6 +105,7 @@ function passthrough(input: TvV2Common): {
     ...(input.assrtToken === undefined ? {} : { assrtToken: input.assrtToken }),
     ...(input.jevJudge === undefined ? {} : { jevJudge: input.jevJudge }),
     ...(input.titleResearch === undefined ? {} : { titleResearch: input.titleResearch }),
+    ...(input.drives === undefined ? {} : { drives: input.drives }),
   };
 }
 
@@ -235,6 +240,337 @@ function progressAndTraceSink(input: {
   );
 }
 
+/** Infer an episode code for a file already placed inside a known `Season NN`
+ *  directory when `episodeCodeFromFileName` returned null (e.g. `1.mp4`..`8.mp4`
+ *  or `EP03.mkv`). Used ONLY for attributing already-marked `obtainedEpisodes` to
+ *  their storage drive and file IDs — never to decide whether an episode is obtained
+ *  (that stays 100% the agent's `markObtained`). */
+function inferSeasonFileEpisodeCode(
+  fileName: string | undefined,
+  seasonNumber: number,
+  explicitCode: string | null,
+): string | null {
+  if (explicitCode) return explicitCode;
+  if (!fileName) return null;
+  const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}`;
+  const stem = fileName.replace(/\.[A-Za-z0-9]+$/, "").trim();
+  const bareDigits = /^0*(\d{1,4})$/.exec(stem);
+  if (bareDigits?.[1]) {
+    const epNum = Number(bareDigits[1]);
+    if (epNum > 0) {
+      return `${seasonPrefix}E${String(epNum).padStart(2, "0")}`;
+    }
+  }
+  const epTag = /(?:^|[^A-Za-z0-9])(?:EP?|E)\s*0*(\d{1,4})(?:$|[^A-Za-z0-9])/i.exec(stem);
+  if (epTag?.[1]) {
+    const epNum = Number(epTag[1]);
+    if (epNum > 0) {
+      return `${seasonPrefix}E${String(epNum).padStart(2, "0")}`;
+    }
+  }
+  return null;
+}
+
+interface TouchedSeasonDriveScan {
+  drive: NonNullable<BridgedV2Result["touchedTargetDrives"]>[number];
+  seasonDirId: string;
+  videoFiles: Array<{ id: string; name?: string; sizeBytes: number; episodeCode: string | null }>;
+  byEp: Map<string, { fileIds: string[]; sizeBytes: number }>;
+}
+
+async function scanTouchedSeasonDrives(
+  touched: NonNullable<BridgedV2Result["touchedTargetDrives"]>,
+  seasonNumber: number,
+): Promise<TouchedSeasonDriveScan[]> {
+  const results = await Promise.all(
+    touched.map(async (drive): Promise<TouchedSeasonDriveScan | null> => {
+      const seasonDirId = drive.seasonDirectoryIds[seasonNumber];
+      if (!seasonDirId) return null;
+      let videoFiles: Array<{ id: string; name?: string; sizeBytes: number; episodeCode: string | null }> = [];
+      try {
+        videoFiles = await drive.executor.listVideoFiles(seasonDirId);
+      } catch {
+        videoFiles = [];
+      }
+      const byEp = new Map<string, { fileIds: string[]; sizeBytes: number }>();
+      for (const vf of videoFiles) {
+        const code = inferSeasonFileEpisodeCode(vf.name, seasonNumber, vf.episodeCode);
+        if (!code) continue;
+        const cur = byEp.get(code) ?? { fileIds: [], sizeBytes: 0 };
+        cur.fileIds.push(vf.id);
+        cur.sizeBytes += vf.sizeBytes;
+        byEp.set(code, cur);
+      }
+      return { drive, seasonDirId, videoFiles, byEp };
+    }),
+  );
+  return results.filter((s): s is TouchedSeasonDriveScan => s !== null);
+}
+
+function createLazySeasonScans(
+  touched: BridgedV2Result["touchedTargetDrives"],
+  seasonNumber: number,
+): () => Promise<TouchedSeasonDriveScan[]> {
+  let promise: Promise<TouchedSeasonDriveScan[]> | undefined;
+  return () => {
+    promise ??= scanTouchedSeasonDrives(touched ?? [], seasonNumber);
+    return promise;
+  };
+}
+
+async function resolvePrimaryDriveSeasonEpisodes(input: {
+  repository: WorkflowRepository;
+  accountId: string;
+  primaryStorageId: string | null;
+  seasonResult: BridgedV2Result["seasons"][number];
+  touchedTargetDrives: BridgedV2Result["touchedTargetDrives"];
+  getScans?: () => Promise<TouchedSeasonDriveScan[]>;
+}): Promise<EpisodeState[]> {
+  const touched = input.touchedTargetDrives ?? [];
+  if (touched.length === 0 || !input.primaryStorageId) {
+    return input.seasonResult.episodes;
+  }
+  const scans = input.getScans
+    ? await input.getScans()
+    : await scanTouchedSeasonDrives(touched, input.seasonResult.season.seasonNumber);
+  const nonEmptyScans = scans.filter((s) => s.videoFiles.length > 0);
+  const primaryScan = scans.find((s) => s.drive.storageId === input.primaryStorageId);
+  if (
+    (touched.length === 1 && primaryScan) ||
+    (nonEmptyScans.length === 1 && nonEmptyScans[0]!.drive.storageId === input.primaryStorageId)
+  ) {
+    return input.seasonResult.episodes;
+  }
+  const byEp = new Map<string, string[]>();
+  if (primaryScan) {
+    for (const [code, info] of primaryScan.byEp) {
+      byEp.set(code, info.fileIds);
+    }
+  }
+  const existingState = await input.repository.getTrackedSeasonState(
+    input.seasonResult.season.id,
+    { accountId: input.accountId, connectedStorageId: input.primaryStorageId },
+  );
+  const priorByCode = new Map(
+    (existingState?.episodes ?? []).filter((e) => e.obtained).map((e) => [e.episodeCode, e.verifiedFileIds]),
+  );
+  return input.seasonResult.episodes.map((ep) => {
+    const driveFiles = ep.obtained ? byEp.get(ep.episodeCode) : undefined;
+    const priorFiles = priorByCode.get(ep.episodeCode);
+    const hasDriveFiles = Boolean(driveFiles && driveFiles.length > 0);
+    const obtainedOnPrimary = hasDriveFiles || priorFiles !== undefined;
+    return {
+      ...ep,
+      obtained: obtainedOnPrimary,
+      verifiedFileIds: hasDriveFiles ? driveFiles! : priorFiles ?? [],
+    };
+  });
+}
+
+async function recordTouchedSeasonCopies(input: {
+  repository: WorkflowRepository;
+  accountId: string;
+  primaryStorageId: string | null;
+  title: MediaTitle;
+  seasonResult: BridgedV2Result["seasons"][number];
+  touchedTargetDrives: BridgedV2Result["touchedTargetDrives"];
+  runId: string;
+  recordedAt: string;
+  getScans?: () => Promise<TouchedSeasonDriveScan[]>;
+}): Promise<EpisodeCopy[]> {
+  if (!input.repository.upsertEpisodeCopies) {
+    return [];
+  }
+  const touched = input.touchedTargetDrives ?? [];
+  const obtainedEpisodes = input.seasonResult.episodes.filter((ep) => ep.obtained);
+  if (obtainedEpisodes.length === 0) {
+    return [];
+  }
+
+  // If no multi-drive coordinator ran (or only the primary drive was touched),
+  // record episode_copies against the primary drive when known.
+  if (touched.length === 0) {
+    if (!input.primaryStorageId) return [];
+    const copies: EpisodeCopy[] = obtainedEpisodes.map((ep) => ({
+      trackedSeasonId: input.seasonResult.season.id,
+      episodeCode: ep.episodeCode,
+      storageId: input.primaryStorageId!,
+      fileIds: [...ep.verifiedFileIds],
+      sizeBytes: null,
+      quality: null,
+      runId: input.runId,
+      recordedAt: input.recordedAt,
+    }));
+    await input.repository.upsertEpisodeCopies(copies);
+    return copies;
+  }
+
+  // Inspect each touched drive's season directory to attribute episodes and file sizes
+  // to the exact storageId where they landed (C8 single source of truth).
+  // An empty directory created during a read-only probe on another drive (0 videoFiles)
+  // must not prevent single-drive attribution when only one drive actually holds files.
+  const scans = input.getScans
+    ? await input.getScans()
+    : await scanTouchedSeasonDrives(touched, input.seasonResult.season.seasonNumber);
+  const nonEmptyScans = scans.filter((s) => s.videoFiles.length > 0);
+  let singleNonEmptyDriveId: string | null = null;
+  if (nonEmptyScans.length === 1) {
+    singleNonEmptyDriveId = nonEmptyScans[0]!.drive.storageId;
+  } else if (scans.length === 1) {
+    singleNonEmptyDriveId = scans[0]!.drive.storageId;
+  }
+
+  const copies: EpisodeCopy[] = [];
+  const verifiedByCode = new Map(
+    obtainedEpisodes.map((e) => [e.episodeCode, e.verifiedFileIds]),
+  );
+  for (const scan of scans) {
+    const { drive, seasonDirId, videoFiles, byEp } = scan;
+    let driveCodes: string[] = [];
+    if (singleNonEmptyDriveId === drive.storageId) {
+      // Only this drive received video files for the season → all agent-marked
+      // obtained episodes belong to this drive (even if filenames are opaque).
+      driveCodes = obtainedEpisodes.map((e) => e.episodeCode);
+    } else if (byEp.size > 0) {
+      driveCodes = [...byEp.keys()].filter((code) => verifiedByCode.has(code));
+    }
+    const perFileFallbackBytes =
+      byEp.size === 0 && videoFiles.length > 0 && driveCodes.length > 0
+        ? Math.round(videoFiles.reduce((sum, vf) => sum + vf.sizeBytes, 0) / driveCodes.length)
+        : null;
+    for (const code of driveCodes) {
+      const info = byEp.get(code);
+      const fallbackFileIds = verifiedByCode.get(code) ?? [];
+      copies.push({
+        trackedSeasonId: input.seasonResult.season.id,
+        episodeCode: code,
+        storageId: drive.storageId,
+        fileIds: info && info.fileIds.length > 0 ? info.fileIds : [...fallbackFileIds],
+        sizeBytes: info ? info.sizeBytes : perFileFallbackBytes,
+        quality: null,
+        runId: input.runId,
+        recordedAt: input.recordedAt,
+      });
+    }
+
+    // If episodes landed on a secondary drive (different from primaryStorageId),
+    // also persist/update that drive's (tracked_season_id, connected_storage_id) bucket
+    // so `episode_states` and `episode_copies` stay 100% consistent across all drives.
+    if (drive.storageId !== input.primaryStorageId && driveCodes.length > 0) {
+      const driveCodeSet = new Set(driveCodes);
+      const existingDriveState = await input.repository.getTrackedSeasonState(
+        input.seasonResult.season.id,
+        { accountId: input.accountId, connectedStorageId: drive.storageId },
+      );
+      const priorByCode = new Map(
+        (existingDriveState?.episodes ?? []).filter((e) => e.obtained).map((e) => [e.episodeCode, e.verifiedFileIds]),
+      );
+      const driveEpisodes = input.seasonResult.episodes.map((ep) => {
+        const inDriveSet = driveCodeSet.has(ep.episodeCode);
+        const info = inDriveSet ? byEp.get(ep.episodeCode) : undefined;
+        const priorFiles = priorByCode.get(ep.episodeCode);
+        const isObtained = inDriveSet || priorFiles !== undefined;
+        let verifiedFileIds: string[] = [];
+        if (info && info.fileIds.length > 0) {
+          verifiedFileIds = info.fileIds;
+        } else if (priorFiles !== undefined) {
+          verifiedFileIds = priorFiles;
+        } else if (inDriveSet) {
+          verifiedFileIds = ep.verifiedFileIds;
+        }
+        return {
+          ...ep,
+          obtained: isObtained,
+          verifiedFileIds,
+        };
+      });
+      const sideRunId = `${input.runId}_drv_${drive.storageId.slice(-8)}`;
+      await input.repository.saveWorkflowRunSnapshot({
+        accountId: input.accountId,
+        connectedStorageId: drive.storageId,
+        title: input.title,
+        season: {
+          ...input.seasonResult.season,
+          storageDirectoryId: seasonDirId,
+        },
+        workflowRun: {
+          id: sideRunId,
+          kind: "type2_init",
+          status: "succeeded",
+          trackedSeasonId: input.seasonResult.season.id,
+          startedAt: input.recordedAt,
+          finishedAt: input.recordedAt,
+          auditEvents: [],
+        },
+        episodes: driveEpisodes,
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+      });
+    }
+  }
+  if (copies.length > 0) {
+    await input.repository.upsertEpisodeCopies(copies);
+  }
+  return copies;
+}
+
+function shortDriveLabel(label: string): string {
+  return label.replace(/\s*(?:网盘|云盘)$/, "");
+}
+
+function appendMultiDriveBreakdownToNotifications(
+  notifications: readonly NotificationEvent[],
+  touchedTargetDrives: BridgedV2Result["touchedTargetDrives"],
+  copies: readonly EpisodeCopy[],
+): NotificationEvent[] {
+  const touched = touchedTargetDrives ?? [];
+  if (touched.length === 0) {
+    return [...notifications];
+  }
+  const storageIdsWithCopies = new Set(copies.map((c) => c.storageId));
+  const drivesWithFiles =
+    storageIdsWithCopies.size > 0
+      ? touched.filter((d) => storageIdsWithCopies.has(d.storageId))
+      : [];
+  const labelById = new Map(
+    touched.map((d) => [d.storageId, shortDriveLabel(d.label)]),
+  );
+  const driveLabels = [...new Set(drivesWithFiles.map((d) => shortDriveLabel(d.label)))];
+  const countByStorage = new Map<string, Set<string>>();
+  for (const c of copies) {
+    let set = countByStorage.get(c.storageId);
+    if (!set) {
+      set = new Set();
+      countByStorage.set(c.storageId, set);
+    }
+    set.add(`${c.trackedSeasonId}:${c.episodeCode}`);
+  }
+  let breakdownLine: string | null = null;
+  if (touched.length > 1 && countByStorage.size > 1) {
+    const parts: string[] = [];
+    for (const [storageId, codes] of countByStorage) {
+      const label = labelById.get(storageId) ?? storageId;
+      parts.push(`${label} ${codes.size} 集`);
+    }
+    breakdownLine = `跨盘分布：${parts.join(" · ")}`;
+  }
+  return notifications.map((n) => {
+    if (!n.report) return n;
+    const nextReport = {
+      ...n.report,
+      ...(driveLabels.length > 0 ? { driveLabels } : {}),
+      ...(breakdownLine ? { lines: [...n.report.lines, breakdownLine] } : {}),
+    };
+    return {
+      ...n,
+      report: nextReport,
+      body: breakdownLine ? formatReportPushText(nextReport) : n.body,
+    };
+  });
+}
+
 async function persistSingleSeason(input: {
   kind: WorkflowKind;
   title: MediaTitle;
@@ -245,9 +581,40 @@ async function persistSingleSeason(input: {
   connectedStorageId?: string | null;
 }): Promise<void> {
   const seasonResult = input.bridged.seasons[0]!;
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const primaryStorageId =
+    input.connectedStorageId ?? input.bridged.touchedTargetDrives?.[0]?.storageId ?? null;
+  const getScans = createLazySeasonScans(
+    input.bridged.touchedTargetDrives,
+    seasonResult.season.seasonNumber,
+  );
+  const primaryEpisodes = await resolvePrimaryDriveSeasonEpisodes({
+    repository: input.repository,
+    accountId,
+    primaryStorageId,
+    seasonResult,
+    touchedTargetDrives: input.bridged.touchedTargetDrives,
+    getScans,
+  });
+  const copies = await recordTouchedSeasonCopies({
+    repository: input.repository,
+    accountId,
+    primaryStorageId,
+    title: input.title,
+    seasonResult,
+    touchedTargetDrives: input.bridged.touchedTargetDrives,
+    runId: input.workflowRun.id,
+    recordedAt: input.workflowRun.finishedAt ?? input.workflowRun.startedAt,
+    getScans,
+  });
+  const notifications = appendMultiDriveBreakdownToNotifications(
+    input.bridged.notifications,
+    input.bridged.touchedTargetDrives,
+    copies,
+  );
   await input.repository.saveWorkflowRunSnapshot({
     ...(input.accountId ? { accountId: input.accountId } : {}),
-    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+    ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
     title: input.title,
     season: seasonResult.season,
     workflowRun: {
@@ -259,11 +626,11 @@ async function persistSingleSeason(input: {
       finishedAt: input.workflowRun.finishedAt,
       auditEvents: input.bridged.auditEvents,
     },
-    episodes: seasonResult.episodes,
+    episodes: primaryEpisodes,
     resourceSnapshots: input.bridged.resourceSnapshots,
     decisions: input.bridged.decisions,
     transferAttempts: input.bridged.transferAttempts,
-    notifications: input.bridged.notifications,
+    notifications,
   });
 }
 
@@ -408,14 +775,55 @@ export async function runSeriesInitializationV2AndPersist(
   // Stamp completion AFTER the run; one finishedAt shared across all season
   // records (the title-level run finished once).
   const finishedAt = now();
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const primaryStorageId =
+    input.connectedStorageId ?? bridged.touchedTargetDrives?.[0]?.storageId ?? null;
   // One record per season under `${runId}_s${n}`, mirroring the old series
   // persistence: resource evidence + notifications ride on the first season
   // only (title-level), not duplicated across N season records.
-  for (const [index, seasonResult] of bridged.seasons.entries()) {
+  const allCopies: EpisodeCopy[] = [];
+  const preparedSeasons: Array<{
+    seasonResult: BridgedV2Result["seasons"][number];
+    seasonRunId: string;
+    primaryEpisodes: EpisodeState[];
+  }> = [];
+  for (const seasonResult of bridged.seasons) {
     const seasonRunId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    const getScans = createLazySeasonScans(
+      bridged.touchedTargetDrives,
+      seasonResult.season.seasonNumber,
+    );
+    const primaryEpisodes = await resolvePrimaryDriveSeasonEpisodes({
+      repository: input.repository,
+      accountId,
+      primaryStorageId,
+      seasonResult,
+      touchedTargetDrives: bridged.touchedTargetDrives,
+      getScans,
+    });
+    const copies = await recordTouchedSeasonCopies({
+      repository: input.repository,
+      accountId,
+      primaryStorageId,
+      title: input.title,
+      seasonResult,
+      touchedTargetDrives: bridged.touchedTargetDrives,
+      runId: seasonRunId,
+      recordedAt: finishedAt,
+      getScans,
+    });
+    allCopies.push(...copies);
+    preparedSeasons.push({ seasonResult, seasonRunId, primaryEpisodes });
+  }
+  const enrichedNotifications = appendMultiDriveBreakdownToNotifications(
+    bridged.notifications,
+    bridged.touchedTargetDrives,
+    allCopies,
+  );
+  for (const [index, { seasonResult, seasonRunId, primaryEpisodes }] of preparedSeasons.entries()) {
     await input.repository.saveWorkflowRunSnapshot({
       ...(input.accountId ? { accountId: input.accountId } : {}),
-      ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+      ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
       title: input.title,
       season: seasonResult.season,
       workflowRun: {
@@ -427,7 +835,7 @@ export async function runSeriesInitializationV2AndPersist(
         finishedAt,
         auditEvents: index === 0 ? bridged.auditEvents : [],
       },
-      episodes: seasonResult.episodes,
+      episodes: primaryEpisodes,
       resourceSnapshots: index === 0 ? bridged.resourceSnapshots : [],
       decisions: index === 0 ? bridged.decisions : [],
       transferAttempts:
@@ -436,7 +844,7 @@ export async function runSeriesInitializationV2AndPersist(
           : [],
       notifications:
         index === 0
-          ? bridged.notifications.map((notification) => ({
+          ? enrichedNotifications.map((notification) => ({
               ...notification,
               id: notification.id.replace(input.workflowRun.id, seasonRunId),
               workflowRunId: seasonRunId,
@@ -517,14 +925,30 @@ export async function runReplaceRequestV2AndPersist(
     // Without it the claimed run would never get a record of its own and stay running.
     throw new Error(`REPLACE_LOCK_SEASON_MISSING: season ${input.lockSeasonNumber} is not among the run's seasons`);
   }
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const primaryStorageId =
+    input.connectedStorageId ?? bridged.touchedTargetDrives?.[0]?.storageId ?? null;
   const owner = {
     ...(input.accountId ? { accountId: input.accountId } : {}),
-    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+    ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
   };
   const finishedAt = now();
+  const allReplaceCopies: EpisodeCopy[] = [];
   for (const seasonResult of bridged.seasons) {
     if (seasonResult === lock) continue;
     const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
+    const getScans = createLazySeasonScans(
+      bridged.touchedTargetDrives,
+      seasonResult.season.seasonNumber,
+    );
+    const primaryEpisodes = await resolvePrimaryDriveSeasonEpisodes({
+      repository: input.repository,
+      accountId,
+      primaryStorageId,
+      seasonResult,
+      touchedTargetDrives: bridged.touchedTargetDrives,
+      getScans,
+    });
     await input.repository.saveWorkflowRunSnapshot({
       ...owner,
       title: input.title,
@@ -538,17 +962,58 @@ export async function runReplaceRequestV2AndPersist(
         finishedAt,
         auditEvents: [],
       },
-      episodes: seasonResult.episodes,
+      episodes: primaryEpisodes,
       resourceSnapshots: [],
       decisions: [],
       transferAttempts: [],
       notifications: [],
     });
+    const copies = await recordTouchedSeasonCopies({
+      repository: input.repository,
+      accountId,
+      primaryStorageId,
+      title: input.title,
+      seasonResult,
+      touchedTargetDrives: bridged.touchedTargetDrives,
+      runId,
+      recordedAt: finishedAt,
+      getScans,
+    });
+    allReplaceCopies.push(...copies);
   }
+  const getLockScans = createLazySeasonScans(
+    bridged.touchedTargetDrives,
+    lock.season.seasonNumber,
+  );
+  const lockPrimaryEpisodes = await resolvePrimaryDriveSeasonEpisodes({
+    repository: input.repository,
+    accountId,
+    primaryStorageId,
+    seasonResult: lock,
+    touchedTargetDrives: bridged.touchedTargetDrives,
+    getScans: getLockScans,
+  });
+  const lockCopies = await recordTouchedSeasonCopies({
+    repository: input.repository,
+    accountId,
+    primaryStorageId,
+    title: input.title,
+    seasonResult: lock,
+    touchedTargetDrives: bridged.touchedTargetDrives,
+    runId: input.workflowRun.id,
+    recordedAt: finishedAt,
+    getScans: getLockScans,
+  });
+  allReplaceCopies.push(...lockCopies);
+  const enrichedReplaceNotifications = appendMultiDriveBreakdownToNotifications(
+    stampNotifications(bridged.notifications, input.notice),
+    bridged.touchedTargetDrives,
+    allReplaceCopies,
+  );
   const held = await saveRunRecord(
     { ...input, now },
     bridged.status,
-    stampNotifications(bridged.notifications, input.notice),
+    enrichedReplaceNotifications,
     (run, notifications) => ({
       ...owner,
       title: input.title,
@@ -561,7 +1026,7 @@ export async function runReplaceRequestV2AndPersist(
         startedAt: input.workflowRun.startedAt,
         auditEvents: [...input.lockAuditEvents, ...bridged.auditEvents],
       },
-      episodes: lock.episodes,
+      episodes: lockPrimaryEpisodes,
       resourceSnapshots: bridged.resourceSnapshots,
       decisions: bridged.decisions,
       transferAttempts: bridged.transferAttempts,
@@ -624,9 +1089,12 @@ export async function runStagingRecoveryV2AndPersist(
   }
   const owner = {
     ...(input.accountId ? { accountId: input.accountId } : {}),
-    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+    ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
   };
   const finishedAt = now();
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const primaryStorageId =
+    input.connectedStorageId ?? bridged.touchedTargetDrives?.[0]?.storageId ?? null;
   for (const seasonResult of bridged.seasons) {
     if (seasonResult === lock) continue;
     const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
@@ -650,6 +1118,16 @@ export async function runStagingRecoveryV2AndPersist(
       notifications: [],
       requireTrackedSeason: true,
     });
+    await recordTouchedSeasonCopies({
+      repository: input.repository,
+      accountId,
+      primaryStorageId,
+      title: input.title,
+      seasonResult,
+      touchedTargetDrives: bridged.touchedTargetDrives,
+      runId,
+      recordedAt: finishedAt,
+    });
   }
   await input.repository.saveWorkflowRunSnapshot({
     ...owner,
@@ -670,6 +1148,16 @@ export async function runStagingRecoveryV2AndPersist(
     transferAttempts: bridged.transferAttempts,
     notifications: [],
     requireTrackedSeason: true,
+  });
+  await recordTouchedSeasonCopies({
+    repository: input.repository,
+    accountId,
+    primaryStorageId,
+    title: input.title,
+    seasonResult: lock,
+    touchedTargetDrives: bridged.touchedTargetDrives,
+    runId: input.workflowRun.id,
+    recordedAt: finishedAt,
   });
   return { ...bridged, notifications: [] };
 }
@@ -768,6 +1256,8 @@ export async function runMovieAcquisitionV2AndPersist(input: {
   agentMemory?: boolean;
   /** Web-reference tools (alternate titles). */
   titleResearch?: TitleResearchOptions;
+  /** Ordered active drives for this account in unified multi-drive mode. */
+  drives?: AcquisitionDriveContext[];
   /** A replace_request run (user message): persisted under kind replace_request. */
   userRequest?: RunMovieAcquisitionV2Request["userRequest"];
   /** Replace runs: whether the film was obtained before (see RunMovieAcquisitionV2Request). */
@@ -810,11 +1300,54 @@ export async function runMovieAcquisitionV2AndPersist(input: {
     ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
     ...memoryOption(input),
     ...(input.titleResearch === undefined ? {} : { titleResearch: input.titleResearch }),
+    ...(input.drives === undefined ? {} : { drives: input.drives }),
   });
 
-  const held = await saveRunRecord({ ...input, now }, result.status, stampNotifications(result.notifications, input.notice), (run, notifications) => ({
+  const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
+  const effectiveStorageId =
+    input.connectedStorageId ?? result.touchedTargetDrives?.[0]?.storageId ?? null;
+  const movieDrive = result.touchedTargetDrives?.[0];
+  let primaryMovieEpisodes = result.episodes;
+  if (
+    movieDrive &&
+    input.connectedStorageId &&
+    movieDrive.storageId !== input.connectedStorageId
+  ) {
+    const existingPrimary = await input.repository.getTrackedSeasonState(result.season.id, {
+      accountId,
+      connectedStorageId: input.connectedStorageId,
+    });
+    const priorByCode = new Map(
+      (existingPrimary?.episodes ?? []).filter((e) => e.obtained).map((e) => [e.episodeCode, e.verifiedFileIds]),
+    );
+    primaryMovieEpisodes = result.episodes.map((ep) => {
+      const priorFiles = priorByCode.get(ep.episodeCode);
+      const hadPriorOnPrimary = priorFiles !== undefined;
+      return {
+        ...ep,
+        obtained: hadPriorOnPrimary,
+        verifiedFileIds: priorFiles ?? [],
+      };
+    });
+  }
+  const obtainedMovie = result.episodes.filter((ep) => ep.obtained);
+  const movieDriveLabels =
+    obtainedMovie.length > 0
+      ? (result.touchedTargetDrives ?? []).map((d) => shortDriveLabel(d.label))
+      : [];
+  const movieNotifications = stampNotifications(result.notifications, input.notice).map((n) => {
+    if (!n.report || movieDriveLabels.length === 0) return n;
+    return {
+      ...n,
+      report: {
+        ...n.report,
+        driveLabels: [...new Set(movieDriveLabels)],
+      },
+    };
+  });
+  const held = await saveRunRecord({ ...input, now }, result.status, movieNotifications, (run, notifications) => ({
     ...(input.accountId ? { accountId: input.accountId } : {}),
-    ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+    ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
     title: input.title,
     season: result.season,
     workflowRun: {
@@ -825,11 +1358,71 @@ export async function runMovieAcquisitionV2AndPersist(input: {
       startedAt: input.workflowRun.startedAt,
       auditEvents: result.auditEvents,
     },
-    episodes: result.episodes,
+    episodes: primaryMovieEpisodes,
     resourceSnapshots: result.resourceSnapshots,
     decisions: result.decisions,
     transferAttempts: result.transferAttempts,
     notifications,
   }));
+  if (input.repository.upsertEpisodeCopies && effectiveStorageId) {
+    const obtainedMovie = result.episodes.filter((ep) => ep.obtained);
+    if (obtainedMovie.length > 0) {
+      const finishedAt = now();
+      const movieDirId = movieDrive?.directoryIds[0];
+      let fileIds: string[] = [];
+      let sizeBytes: number | null = null;
+      if (movieDrive && movieDirId) {
+        try {
+          const vfs = await movieDrive.executor.listVideoFiles(movieDirId);
+          fileIds = vfs.map((f) => f.id);
+          sizeBytes = vfs.reduce((sum, f) => sum + f.sizeBytes, 0) || null;
+        } catch {
+          fileIds = [];
+        }
+      }
+      if (
+        movieDrive &&
+        input.connectedStorageId &&
+        movieDrive.storageId !== input.connectedStorageId
+      ) {
+        const sideRunId = `${input.workflowRun.id}_drv_${movieDrive.storageId.slice(-8)}`;
+        await input.repository.saveWorkflowRunSnapshot({
+          accountId,
+          connectedStorageId: movieDrive.storageId,
+          title: input.title,
+          season: {
+            ...result.season,
+            ...(movieDirId ? { storageDirectoryId: movieDirId } : {}),
+          },
+          workflowRun: {
+            id: sideRunId,
+            kind: input.userRequest ? "replace_request" : "movie_init",
+            status: "succeeded",
+            trackedSeasonId: result.season.id,
+            startedAt: finishedAt,
+            finishedAt,
+            auditEvents: [],
+          },
+          episodes: result.episodes,
+          resourceSnapshots: [],
+          decisions: [],
+          transferAttempts: [],
+          notifications: [],
+        });
+      }
+      await input.repository.upsertEpisodeCopies(
+        obtainedMovie.map((ep) => ({
+          trackedSeasonId: result.season.id,
+          episodeCode: ep.episodeCode,
+          storageId: movieDrive?.storageId ?? effectiveStorageId,
+          fileIds: fileIds.length > 0 ? fileIds : [...ep.verifiedFileIds],
+          sizeBytes,
+          quality: null,
+          runId: input.workflowRun.id,
+          recordedAt: finishedAt,
+        })),
+      );
+    }
+  }
   return { ...result, ...held };
 }

@@ -15,6 +15,7 @@ import { RestoreFreeLlmButton } from "../../components/restore-free-llm-button";
 import { TmdbApiKeyForm } from "../../components/tmdb-api-key-form";
 import { AssrtTokenForm } from "../../components/assrt-token-form";
 import { ProwlarrConfigForm } from "../../components/prowlarr-config-form";
+import { HaisouConfigForm } from "../../components/haisou-config-form";
 import { JevPrefilterForm } from "../../components/jev-prefilter-form";
 import { ServiceBlock } from "../../components/service-block";
 import { AgentMemoryNotes, AgentMemoryStats } from "../../components/agent-memory-panel";
@@ -25,7 +26,7 @@ import {
   memoryStatsForUi,
   toMemoryItem,
 } from "../../lib/agent-memory-server";
-import { assrtPills, isEnvBackedValue, jevPills, llmPills, pansouPills, prowlarrPills, tmdbPills } from "../../lib/service-status";
+import { assrtPills, haisouPills, isEnvBackedValue, jevPills, llmPills, pansouPills, prowlarrPills, tmdbPills } from "../../lib/service-status";
 import { PanSouConfigForm } from "../../components/pansou-config-form";
 import { DailySweepForm } from "../../components/daily-sweep-form";
 import { PatrolConcurrencyForm } from "../../components/patrol-concurrency-form";
@@ -63,6 +64,8 @@ import {
   PROWLARR_BASE_URL_SETTING_KEY,
   PROWLARR_API_KEY_SETTING_KEY,
   getProwlarrConfig,
+  HAISOU_API_KEY_SETTING_KEY,
+  getHaisouApiKey,
   resolveAgentModelConfig,
   getJevConfig,
   getJevBaseUrlOverride,
@@ -76,7 +79,15 @@ import {
   resolveGlobalWorkspace,
   resolveIsDesktop,
 } from "../../lib/workflow-runtime";
-import { brandSupportsProwlarr, brandsSupportingProwlarr, FREE_LLM_PRESET, getStorageBrand, isFreeLlmPreset, isRegisteredStorageProvider } from "@media-track/workflow";
+import {
+  brandSupportsProwlarr,
+  brandsSupportingProwlarr,
+  formatDriveSpaceSummary,
+  FREE_LLM_PRESET,
+  getStorageBrand,
+  isFreeLlmPreset,
+  isRegisteredStorageProvider,
+} from "@media-track/workflow";
 import { isDemoMode } from "../../lib/demo-mode";
 
 export default function SettingsPage({
@@ -520,6 +531,9 @@ async function ResourceProviderSection() {
   const pansouHealth = (await repository.getSetting(PANSOU_HEALTH_SETTING_KEY)) ?? "";
   const prowlarrBaseURL = (await repository.getSetting(PROWLARR_BASE_URL_SETTING_KEY)) ?? "";
   const prowlarrApiKeySet = Boolean((await repository.getSetting(PROWLARR_API_KEY_SETTING_KEY))?.trim());
+  const haisouApiKeySet = Boolean((await repository.getSetting(HAISOU_API_KEY_SETTING_KEY))?.trim());
+  // The form shows DB state; the pill follows what the worker mounts (DB → env).
+  const haisouFromEnv = !haisouApiKeySet && Boolean((await getHaisouApiKey(repository))?.trim());
   // The form shows the DB values; the pill follows what the worker mounts
   // (getProwlarrConfig: DB → env PROWLARR_BASE_URL / PROWLARR_API_KEY).
   const prowlarr = await getProwlarrConfig(repository);
@@ -586,6 +600,30 @@ async function ResourceProviderSection() {
         }
       >
         <PanSouConfigForm baseURL={pansouBaseURL} />
+      </ServiceBlock>
+      <ServiceBlock
+        name="海搜 (haisou)"
+        pills={haisouPills({ apiKeySet: haisouApiKeySet || haisouFromEnv, fromEnv: haisouFromEnv })}
+        summary="补充源：自有索引（夸克 2.48 亿文件，光鸭/天翼也有量）。走站方官方 API，每天前 100 次免费。"
+        details={
+          <>
+            <p>
+              海搜是独立索引的网盘搜索库，和 PanSou 的数据源不重合。这个接入走它挂在 idatariver 上的<b>官方 API</b>（海搜页面底部的「开放接口」就指向那里），不是去爬它的网站——所以只需要一个 API Key，不需要登录账号或粘贴 cookie。
+            </p>
+            <p>
+              <b>每天前 100 次免费</b>，之后阶梯计费（约 $0.0001/次）。按常规用量（每天巡检一两个时间点）够用；如果你把巡检时间点加得很密、或同时追很多部，可能会碰到额度上限。额度用完后这个源会返回「没结果」而不是报错，所以别把它当成 PanSou 的唯一来源。
+            </p>
+            <p>
+              取 Key：{" "}
+              <a href="https://www.idatariver.com/zh-cn/console/apikeys" target="_blank" rel="noopener noreferrer">
+                idatariver 控制台 → API Keys <ExternalLink size={12} style={{ verticalAlign: "-1px" }} />
+              </a>
+              {" "}（注册免费，选中 haisou API 项目即可）
+            </p>
+          </>
+        }
+      >
+        <HaisouConfigForm apiKeySet={haisouApiKeySet} />
       </ServiceBlock>
       {showProwlarr ? (
         <ServiceBlock
@@ -670,7 +708,7 @@ function providerLabel(provider: string): string {
 async function Pan115Section() {
   await connection();
   const status = await getPan115ConnectionStatus();
-  const drives = await getAccountConnectedStorages();
+  const drives = await getAccountConnectedStorages({ includeSpace: true });
 
   return (
     <section className="panel" style={{ maxWidth: 720 }}>
@@ -680,7 +718,7 @@ async function Pan115Section() {
             <Cable size={16} aria-hidden style={{ verticalAlign: "-2px", marginRight: 8 }} />
             网盘连接
           </h2>
-          <p className="panel-note">每块盘是独立工作区，左上角可切换；凭证入库后自动用于转存</p>
+          <p className="panel-note">多块网盘统一协作：根据资源画质与剩余空间自动入库，单盘能收齐绝不拆盘</p>
         </div>
         {(() => {
           // #93: derive the header badge from ALL drives — 115-only status made
@@ -708,6 +746,24 @@ async function Pan115Section() {
           {drives.map((drive) => {
             const frozen = drive.status === "frozen";
             const ready = !frozen && drive.provisioned;
+            const spaceSummary = formatDriveSpaceSummary(drive.space);
+            let dotTitle = "目录待建";
+            let dotAriaLabel = "目录待建";
+            if (frozen) {
+              dotTitle = "凭证已失效，重新绑定同一账号即可恢复";
+              dotAriaLabel = "掉线";
+            } else if (ready) {
+              dotTitle = "目录已就绪";
+              dotAriaLabel = "就绪";
+            }
+            let statusMetaNode = <span>就绪</span>;
+            if (frozen) {
+              statusMetaNode = <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>;
+            } else if (!drive.provisioned) {
+              statusMetaNode = <span className="tone-amber-text">目录待建</span>;
+            } else if (drive.connectedAt) {
+              statusMetaNode = <span>{drive.connectedAt.slice(0, 10)} 连接</span>;
+            }
             return (
               <div key={drive.id} className={`drive-card${frozen ? " is-frozen" : ""}`}>
                 <div className="drive-card-head">
@@ -723,23 +779,19 @@ async function Pan115Section() {
                   <span
                     className={`drive-dot ${ready ? "green" : "amber"}`}
                     role="img"
-                    title={frozen ? "凭证已失效，重新绑定同一账号即可恢复" : ready ? "目录已就绪" : "目录待建"}
-                    aria-label={frozen ? "掉线" : ready ? "就绪" : "目录待建"}
+                    title={dotTitle}
+                    aria-label={dotAriaLabel}
                   />
                 </div>
                 <div className="drive-card-uid" title={drive.providerUid}>
                   {maskProviderUid(drive.providerUid)}
                 </div>
                 <div className="drive-card-meta">
-                  {frozen ? (
-                    <span className="tone-amber-text">掉线 · 重新绑定即恢复</span>
-                  ) : !drive.provisioned ? (
-                    <span className="tone-amber-text">目录待建</span>
-                  ) : drive.connectedAt ? (
-                    <span>{drive.connectedAt.slice(0, 10)} 连接</span>
-                  ) : (
-                    <span>就绪</span>
-                  )}
+                  {statusMetaNode}
+                  <span> · </span>
+                  <span className={spaceSummary.overQuota ? "tone-amber-text" : undefined}>
+                    {spaceSummary.badgeText}
+                  </span>
                 </div>
                 <div className="drive-card-actions">
                   <TestConnectionButton storageId={drive.id} />
@@ -754,7 +806,7 @@ async function Pan115Section() {
       <p className="panel-note drive-add-heading">
         {drives.length > 0 ? "添加网盘 · 选择品牌开始连接" : "添加你的第一块网盘"}
         {drives.length > 0 ? (
-          <span className="drive-add-hint">不同账号即新增一块独立工作区；绑已连的同一账号会自动刷新登录</span>
+          <span className="drive-add-hint">不同账号即新增一块可用网盘；绑已连的同一账号会自动刷新登录</span>
         ) : null}
       </p>
       <AddDriveBrandTabs defaultBrand={drives.length > 0 ? null : "pan115"} />

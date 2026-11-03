@@ -905,6 +905,108 @@ describe("workerHasConfiguredDrive (C1: any account's drive counts)", () => {
     vi.spyOn(repo, "hasAnyConnectedStorage").mockRejectedValueOnce(new Error("db down"));
     await expect(rt.workerHasConfiguredDrive()).resolves.toBe(false);
   });
+
+  it("runScheduledType3 & runNextQueuedWorkflow in adapter=115 without PAN115_COOKIE do not throw PAN115_COOKIE is required (issue #186)", async () => {
+    const prevAgent = process.env.MEDIA_TRACK_AGENT_ADAPTER;
+    process.env.MEDIA_TRACK_AGENT_ADAPTER = "vercel-ai";
+    try {
+      const rt = await boot();
+      const repo = rt.getWorkflowRepository();
+      // Multi-user or non-115 user where acct_default has no 115 cookie (or first row has empty payload)
+      await repo.upsertConnectedStorage({
+        id: "cs_broken_first",
+        accountId: "acct_default",
+        provider: "pan115",
+        providerUid: "broken",
+        label: "broken",
+        payload: {},
+        rootCid: null,
+        moviesCid: null,
+        tvCid: null,
+        animeCid: null,
+        createdAt: "2026-07-01T00:00:00.000Z",
+      });
+      await expect(rt.runScheduledType3({ force: true })).resolves.toMatchObject({ outcomes: [] });
+      await expect(rt.runNextQueuedWorkflow()).resolves.toEqual({ status: "idle" });
+    } finally {
+      if (prevAgent === undefined) delete process.env.MEDIA_TRACK_AGENT_ADAPTER;
+      else process.env.MEDIA_TRACK_AGENT_ADAPTER = prevAgent;
+    }
+  });
+
+  it("runScheduledType3 does not crash with MEDIA_TRACK_115_WRITE_SCOPE_REQUIRED when a tracked show references an unbound drive and pan115.cookie is hydrated without env scope CIDs", async () => {
+    const prevAgent = process.env.MEDIA_TRACK_AGENT_ADAPTER;
+    process.env.MEDIA_TRACK_AGENT_ADAPTER = "vercel-ai";
+    try {
+      const rt = await boot();
+      const repo = rt.getWorkflowRepository();
+      // Hydrated legacy 115 cookie mirror in app_settings, with no MEDIA_TRACK_115_TEST_ROOT_CID in env
+      await repo.setSetting("pan115.cookie", "UID=103164004_R2_1; CID=abc; SEID=def");
+      // Tracked season pinned to an unbound drive id (e.g. cs_quark_old that was later replaced)
+      await repo.saveWorkflowRunSnapshot({
+        accountId: "acct_default",
+        connectedStorageId: "cs_quark_unbound",
+        title: {
+          id: "tmdb_tv_154494",
+          tmdbId: 154494,
+          type: "tv",
+          title: "莉可丽丝",
+          originalTitle: "リコリス・リコイル",
+          year: 2022,
+          aliases: [],
+        },
+        season: {
+          id: "tmdb_tv_154494_s1",
+          mediaTitleId: "tmdb_tv_154494",
+          seasonNumber: 1,
+          status: "active",
+          qualityPreference: "4K",
+          storageDirectoryId: "dir_1",
+          totalEpisodes: 1,
+          latestAiredEpisode: 1,
+          latestAiredSource: "metadata",
+        },
+        workflowRun: {
+          id: "seed_unbound",
+          kind: "type2_init",
+          status: "succeeded",
+          trackedSeasonId: "tmdb_tv_154494_s1",
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          auditEvents: [],
+        },
+        episodes: [
+          {
+            trackedSeasonId: "tmdb_tv_154494_s1",
+            episodeCode: "S01E01",
+            title: "Episode 1",
+            airDate: null,
+            airStatus: "aired",
+            metadataStatus: "confirmed",
+            obtained: true,
+            verifiedFileIds: ["f1"],
+          },
+        ],
+        resourceSnapshots: [],
+        decisions: [],
+        transferAttempts: [],
+        notifications: [],
+      });
+
+      await expect(rt.runScheduledType3({ force: true })).resolves.toMatchObject({
+        outcomes: [
+          expect.objectContaining({
+            trackedSeasonId: "tmdb_tv_154494_s1",
+            status: "failed",
+            errorMessage: expect.stringContaining("尚未连接可用网盘"),
+          }),
+        ],
+      });
+    } finally {
+      if (prevAgent === undefined) delete process.env.MEDIA_TRACK_AGENT_ADAPTER;
+      else process.env.MEDIA_TRACK_AGENT_ADAPTER = prevAgent;
+    }
+  });
 });
 
 describe("requireAuthenticatedAccountId (C2: refuse acct_unauthenticated writes)", () => {
