@@ -26,6 +26,7 @@ import type { PersistWorkflowRunSnapshotInput, WorkflowRepository } from "./repo
 import { userMessageDrive } from "./user-requests.js";
 import { formatReportPushText, stampReplaceNotification } from "./notification-report.js";
 import { shortDriveLabel } from "./storage-brands.js";
+import { episodeCodeFromFileName } from "./episode-code.js";
 
 /**
  * Phase 7d — production persist wrappers on the V2 engine. These mirror the old
@@ -246,14 +247,24 @@ function progressAndTraceSink(input: {
  *  or `EP03.mkv`). Used ONLY for attributing already-marked `obtainedEpisodes` to
  *  their storage drive and file IDs — never to decide whether an episode is obtained
  *  (that stays 100% the agent's `markObtained`). */
-function inferSeasonFileEpisodeCode(
+export function inferSeasonFileEpisodeCode(
   fileName: string | undefined,
   seasonNumber: number,
   explicitCode: string | null,
 ): string | null {
-  if (explicitCode) return explicitCode;
-  if (!fileName) return null;
   const seasonPrefix = `S${String(seasonNumber).padStart(2, "0")}`;
+  // The file sits in this season's directory. The parser reports a season-less name
+  // (`第3集`) as S01; it is this season's episode. A code naming another season — or
+  // one with no file name to show it was season-less — is misfiled: nothing.
+  const inThisSeason = (code: string): string | null => {
+    const parts = /^S(\d+)E(\d+)$/.exec(code);
+    if (!parts || Number(parts[1]) === seasonNumber) return code;
+    return fileName === undefined || /[Ss]\d{1,2}[Ee]\d/.test(fileName) ? null : `${seasonPrefix}E${parts[2]}`;
+  };
+  if (explicitCode) return inThisSeason(explicitCode);
+  if (!fileName) return null;
+  const named = episodeCodeFromFileName(fileName);
+  if (named) return inThisSeason(named);
   const stem = fileName.replace(/\.[A-Za-z0-9]+$/, "").trim();
   const bareDigits = /^0*(\d{1,4})$/.exec(stem);
   if (bareDigits?.[1]) {
@@ -269,6 +280,24 @@ function inferSeasonFileEpisodeCode(
       return `${seasonPrefix}E${String(epNum).padStart(2, "0")}`;
     }
   }
+  // `38~4K`, `52 4K`, `CZZLZDWS-45`: once the technical tokens are gone, a name
+  // left with exactly one number names the episode. Two numbers is a guess — none.
+  const numbers = stem
+    .replace(/\d{3,4}[pi]\b/gi, " ")
+    .replace(/\b\d{1,2}k\b/gi, " ")
+    .replace(/[hx]\.?26[45]/gi, " ")
+    .replace(/\d+(?:\.\d+)?\s*(?:fps|帧|bit)/gi, " ")
+    .replace(/\d+\s*audios?/gi, " ")
+    .replace(/(?:ddp?|e?ac3|aac|dts(?:-?hd)?(?:\s*ma)?|truehd|atmos|flac|opus)[\s.]*\d\.\d/gi, " ")
+    .replace(/(?:19|20)\d{2}/g, " ")
+    .replace(/s\d{1,2}(?!\d)/gi, " ")
+    .match(/\d+/g);
+  if (numbers?.length === 1 && numbers[0]!.length <= 4) {
+    const epNum = Number(numbers[0]);
+    if (epNum > 0) {
+      return `${seasonPrefix}E${String(epNum).padStart(2, "0")}`;
+    }
+  }
   return null;
 }
 
@@ -277,6 +306,8 @@ interface TouchedSeasonDriveScan {
   seasonDirId: string;
   videoFiles: Array<{ id: string; name?: string; sizeBytes: number; episodeCode: string | null }>;
   byEp: Map<string, { fileIds: string[]; sizeBytes: number }>;
+  /** Video files whose names name no episode. */
+  unmappedFileCount: number;
 }
 
 async function scanTouchedSeasonDrives(
@@ -294,15 +325,21 @@ async function scanTouchedSeasonDrives(
         videoFiles = [];
       }
       const byEp = new Map<string, { fileIds: string[]; sizeBytes: number }>();
+      let unmappedFileCount = 0;
       for (const vf of videoFiles) {
         const code = inferSeasonFileEpisodeCode(vf.name, seasonNumber, vf.episodeCode);
-        if (!code) continue;
+        if (!code) {
+          // Only a name that says nothing counts; a misfiled episode of another season
+          // says plenty and must not draw the fallback to its drive.
+          if (!vf.episodeCode && !episodeCodeFromFileName(vf.name ?? "")) unmappedFileCount += 1;
+          continue;
+        }
         const cur = byEp.get(code) ?? { fileIds: [], sizeBytes: 0 };
         cur.fileIds.push(vf.id);
         cur.sizeBytes += vf.sizeBytes;
         byEp.set(code, cur);
       }
-      return { drive, seasonDirId, videoFiles, byEp };
+      return { drive, seasonDirId, videoFiles, byEp, unmappedFileCount };
     }),
   );
   return results.filter((s): s is TouchedSeasonDriveScan => s !== null);
@@ -319,6 +356,59 @@ function createLazySeasonScans(
   };
 }
 
+/**
+ * Which drive each episode the agent marked this run is on, read from the season
+ * directories the run touched. One drive with files takes them all; otherwise a
+ * file name naming the episode places it. An episode no name names still goes
+ * somewhere: to the drive with the most files whose names name nothing, else the
+ * primary. Dropped, it would be missing again on the next patrol, found again in
+ * the directory and reported as new every day (伟大的长征: `38~4K.mp4`,
+ * `CZZLZDWS-45.mkv`).
+ */
+function attributeLandedEpisodes(
+  scans: readonly TouchedSeasonDriveScan[],
+  landed: readonly string[],
+  primaryStorageId: string | null,
+): Map<string, Set<string>> {
+  const byDrive = new Map<string, Set<string>>();
+  const place = (storageId: string, code: string) => {
+    const set = byDrive.get(storageId) ?? new Set<string>();
+    set.add(code);
+    byDrive.set(storageId, set);
+  };
+  if (landed.length === 0) return byDrive;
+  const nonEmpty = scans.filter((s) => s.videoFiles.length > 0);
+  const only = nonEmpty.length === 1 ? nonEmpty[0] : scans.length === 1 ? scans[0] : undefined;
+  if (only) {
+    for (const code of landed) place(only.drive.storageId, code);
+    return byDrive;
+  }
+  const landedSet = new Set(landed);
+  const placed = new Set<string>();
+  for (const scan of scans) {
+    for (const code of scan.byEp.keys()) {
+      if (!landedSet.has(code)) continue;
+      place(scan.drive.storageId, code);
+      placed.add(code);
+    }
+  }
+  const unplaced = landed.filter((code) => !placed.has(code));
+  if (unplaced.length > 0) {
+    let target: string | null = null;
+    let most = 0;
+    for (const scan of scans) {
+      const isPrimary = scan.drive.storageId === primaryStorageId;
+      if (scan.unmappedFileCount > most || (scan.unmappedFileCount === most && most > 0 && isPrimary)) {
+        target = scan.drive.storageId;
+        most = scan.unmappedFileCount;
+      }
+    }
+    target ??= primaryStorageId;
+    if (target) for (const code of unplaced) place(target, code);
+  }
+  return byDrive;
+}
+
 async function resolvePrimaryDriveSeasonEpisodes(input: {
   repository: WorkflowRepository;
   accountId: string;
@@ -326,6 +416,8 @@ async function resolvePrimaryDriveSeasonEpisodes(input: {
   seasonResult: BridgedV2Result["seasons"][number];
   touchedTargetDrives: BridgedV2Result["touchedTargetDrives"];
   getScans?: () => Promise<TouchedSeasonDriveScan[]>;
+  /** See recordTouchedSeasonCopies. */
+  priorObtained?: ReadonlySet<string>;
 }): Promise<EpisodeState[]> {
   const touched = input.touchedTargetDrives ?? [];
   if (touched.length === 0 || !input.primaryStorageId) {
@@ -355,11 +447,16 @@ async function resolvePrimaryDriveSeasonEpisodes(input: {
   const priorByCode = new Map(
     (existingState?.episodes ?? []).filter((e) => e.obtained).map((e) => [e.episodeCode, e.verifiedFileIds]),
   );
+  const prior = input.priorObtained ?? new Set<string>();
+  const landed = input.seasonResult.episodes
+    .filter((ep) => ep.obtained && !prior.has(ep.episodeCode))
+    .map((ep) => ep.episodeCode);
+  const onPrimary = attributeLandedEpisodes(scans, landed, input.primaryStorageId).get(input.primaryStorageId);
   return input.seasonResult.episodes.map((ep) => {
     const driveFiles = ep.obtained ? byEp.get(ep.episodeCode) : undefined;
     const priorFiles = priorByCode.get(ep.episodeCode);
     const hasDriveFiles = Boolean(driveFiles && driveFiles.length > 0);
-    const obtainedOnPrimary = hasDriveFiles || priorFiles !== undefined;
+    const obtainedOnPrimary = Boolean(onPrimary?.has(ep.episodeCode)) || priorFiles !== undefined;
     return {
       ...ep,
       obtained: obtainedOnPrimary,
@@ -378,6 +475,10 @@ async function recordTouchedSeasonCopies(input: {
   runId: string;
   recordedAt: string;
   getScans?: () => Promise<TouchedSeasonDriveScan[]>;
+  /** Episodes the primary drive already held before this run. Their copies were
+   *  recorded when they landed; this run carries no file ids for them, so it must not
+   *  record them again, nor hand them to another drive. */
+  priorObtained?: ReadonlySet<string>;
 }): Promise<EpisodeCopy[]> {
   if (!input.repository.upsertEpisodeCopies) {
     return [];
@@ -387,12 +488,16 @@ async function recordTouchedSeasonCopies(input: {
   if (obtainedEpisodes.length === 0) {
     return [];
   }
+  const prior = input.priorObtained ?? new Set<string>();
+  const landedThisRun = obtainedEpisodes.filter((ep) => !prior.has(ep.episodeCode));
+  const landedCodes = new Set(landedThisRun.map((ep) => ep.episodeCode));
 
   // If no multi-drive coordinator ran (or only the primary drive was touched),
-  // record episode_copies against the primary drive when known.
+  // record episode_copies against the primary drive when known — only for what
+  // landed this run: an already-current patrol has nothing to record (issue #369).
   if (touched.length === 0) {
-    if (!input.primaryStorageId) return [];
-    const copies: EpisodeCopy[] = obtainedEpisodes.map((ep) => ({
+    if (!input.primaryStorageId || landedThisRun.length === 0) return [];
+    const copies: EpisodeCopy[] = landedThisRun.map((ep) => ({
       trackedSeasonId: input.seasonResult.season.id,
       episodeCode: ep.episodeCode,
       storageId: input.primaryStorageId!,
@@ -413,13 +518,10 @@ async function recordTouchedSeasonCopies(input: {
   const scans = input.getScans
     ? await input.getScans()
     : await scanTouchedSeasonDrives(touched, input.seasonResult.season.seasonNumber);
-  const nonEmptyScans = scans.filter((s) => s.videoFiles.length > 0);
-  let singleNonEmptyDriveId: string | null = null;
-  if (nonEmptyScans.length === 1) {
-    singleNonEmptyDriveId = nonEmptyScans[0]!.drive.storageId;
-  } else if (scans.length === 1) {
-    singleNonEmptyDriveId = scans[0]!.drive.storageId;
-  }
+  // A read-only inspection also counts a drive as touched; its directory shows the
+  // earlier episodes too, which were recorded when they landed — only this run's are
+  // attributed.
+  const attribution = attributeLandedEpisodes(scans, [...landedCodes], input.primaryStorageId);
 
   const copies: EpisodeCopy[] = [];
   const verifiedByCode = new Map(
@@ -427,16 +529,25 @@ async function recordTouchedSeasonCopies(input: {
   );
   for (const scan of scans) {
     const { drive, seasonDirId, videoFiles, byEp } = scan;
-    let driveCodes: string[] = [];
-    if (singleNonEmptyDriveId === drive.storageId) {
-      // Only this drive received video files for the season → all agent-marked
-      // obtained episodes belong to this drive (even if filenames are opaque).
-      driveCodes = obtainedEpisodes.map((e) => e.episodeCode);
-    } else if (byEp.size > 0) {
-      driveCodes = [...byEp.keys()].filter((code) => verifiedByCode.has(code));
-    }
+    const driveCodes = [...(attribution.get(drive.storageId) ?? [])];
+    // What a secondary drive already held: kept in its snapshot below, and a reason
+    // not to share its directory's bytes among this run's episodes.
+    const existingDriveState =
+      drive.storageId !== input.primaryStorageId && driveCodes.length > 0
+        ? await input.repository.getTrackedSeasonState(input.seasonResult.season.id, {
+            accountId: input.accountId,
+            connectedStorageId: drive.storageId,
+          })
+        : null;
+    const driveHeldBefore =
+      drive.storageId === input.primaryStorageId
+        ? prior.size > 0
+        : (existingDriveState?.episodes ?? []).some((e) => e.obtained);
+    // Opaque names: share the directory's bytes among the episodes — only when the
+    // directory holds nothing but this run's files (no episode the drive held before).
+    const dirHoldsOnlyThisRun = !driveHeldBefore;
     const perFileFallbackBytes =
-      byEp.size === 0 && videoFiles.length > 0 && driveCodes.length > 0
+      byEp.size === 0 && videoFiles.length > 0 && driveCodes.length > 0 && dirHoldsOnlyThisRun
         ? Math.round(videoFiles.reduce((sum, vf) => sum + vf.sizeBytes, 0) / driveCodes.length)
         : null;
     for (const code of driveCodes) {
@@ -459,10 +570,6 @@ async function recordTouchedSeasonCopies(input: {
     // so `episode_states` and `episode_copies` stay 100% consistent across all drives.
     if (drive.storageId !== input.primaryStorageId && driveCodes.length > 0) {
       const driveCodeSet = new Set(driveCodes);
-      const existingDriveState = await input.repository.getTrackedSeasonState(
-        input.seasonResult.season.id,
-        { accountId: input.accountId, connectedStorageId: drive.storageId },
-      );
       const priorByCode = new Map(
         (existingDriveState?.episodes ?? []).filter((e) => e.obtained).map((e) => [e.episodeCode, e.verifiedFileIds]),
       );
@@ -485,6 +592,12 @@ async function recordTouchedSeasonCopies(input: {
           verifiedFileIds,
         };
       });
+      // The snapshot replaces this drive's records: an episode it held that the run's
+      // result has no row for (a provider-ahead episode past the season's range) stays.
+      const resultCodes = new Set(input.seasonResult.episodes.map((ep) => ep.episodeCode));
+      for (const held of existingDriveState?.episodes ?? []) {
+        if (held.obtained && !resultCodes.has(held.episodeCode)) driveEpisodes.push(held);
+      }
       const sideRunId = `${input.runId}_drv_${drive.storageId.slice(-8)}`;
       await input.repository.saveWorkflowRunSnapshot({
         accountId: input.accountId,
@@ -508,6 +621,24 @@ async function recordTouchedSeasonCopies(input: {
         decisions: [],
         transferAttempts: [],
         notifications: [],
+      });
+    }
+  }
+  // The primary can be given episodes without a scan of its own (no season dir was
+  // touched there): record them like its episode_states do.
+  const scanned = new Set(scans.map((scan) => scan.drive.storageId));
+  for (const [storageId, codes] of attribution) {
+    if (scanned.has(storageId)) continue;
+    for (const code of codes) {
+      copies.push({
+        trackedSeasonId: input.seasonResult.season.id,
+        episodeCode: code,
+        storageId,
+        fileIds: [...(verifiedByCode.get(code) ?? [])],
+        sizeBytes: null,
+        quality: null,
+        runId: input.runId,
+        recordedAt: input.recordedAt,
       });
     }
   }
@@ -576,6 +707,8 @@ async function persistSingleSeason(input: {
   repository: WorkflowRepository;
   accountId?: string;
   connectedStorageId?: string | null;
+  /** See recordTouchedSeasonCopies. */
+  priorObtained?: ReadonlySet<string>;
 }): Promise<void> {
   const seasonResult = input.bridged.seasons[0]!;
   const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
@@ -592,6 +725,7 @@ async function persistSingleSeason(input: {
     seasonResult,
     touchedTargetDrives: input.bridged.touchedTargetDrives,
     getScans,
+    ...(input.priorObtained ? { priorObtained: input.priorObtained } : {}),
   });
   const copies = await recordTouchedSeasonCopies({
     repository: input.repository,
@@ -603,6 +737,7 @@ async function persistSingleSeason(input: {
     runId: input.workflowRun.id,
     recordedAt: input.workflowRun.finishedAt ?? input.workflowRun.startedAt,
     getScans,
+    ...(input.priorObtained ? { priorObtained: input.priorObtained } : {}),
   });
   const notifications = appendMultiDriveBreakdownToNotifications(
     input.bridged.notifications,
@@ -681,9 +816,18 @@ export async function runType2InitializationV2AndPersist(
 }
 
 export async function runType3MonitoringV2AndPersist(
-  input: TvV2Common & { season: TrackedSeason; episodes: EpisodeState[] },
+  input: TvV2Common & {
+    season: TrackedSeason;
+    /** This drive's own episode records. */
+    episodes: EpisodeState[];
+    /** Episodes obtained on any of the account's drives. They count as had when the
+     *  need is worked out, but are never written into this drive's records. */
+    crossDriveObtained?: string[];
+  },
 ): Promise<BridgedV2Result> {
   const now = resolveNow(input);
+  const localObtained = new Set(input.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode));
+  const obtainedAnywhere = new Set([...localObtained, ...(input.crossDriveObtained ?? [])]);
   const bridged = await runTvAcquisitionV2({
     title: input.title,
     mode: "type3",
@@ -703,12 +847,12 @@ export async function runType3MonitoringV2AndPersist(
     model: input.model,
     workflowRunId: input.workflowRun.id,
     // 实有 = the DB obtained marks; the need is aired − these (NOT a 115 scan).
-    priorObtained: input.episodes.filter((episode) => episode.obtained).map((episode) => episode.episodeCode),
+    priorObtained: [...obtainedAnywhere],
     now,
     onProgress: progressAndTraceSink({
       repository: input.repository,
       workflowRunId: input.workflowRun.id,
-      neededHint: input.episodes.filter((episode) => episode.airStatus === "aired" && !episode.obtained).length,
+      neededHint: input.episodes.filter((episode) => episode.airStatus === "aired" && !obtainedAnywhere.has(episode.episodeCode)).length,
       storage: input.storage,
     }),
     ...passthrough(input),
@@ -717,16 +861,50 @@ export async function runType3MonitoringV2AndPersist(
     ...linkHistoryOption({ ...input, workflowRunId: input.workflowRun.id, now }),
   });
 
+  const elsewhereOnly = new Set([...obtainedAnywhere].filter((code) => !localObtained.has(code)));
   await persistSingleSeason({
     kind: "type3_monitor",
     title: input.title,
-    bridged,
+    bridged: {
+      ...bridged,
+      seasons: bridged.seasons.map((seasonResult) => keepDriveLocalRecords(seasonResult, input.episodes, elsewhereOnly)),
+    },
     workflowRun: { ...input.workflowRun, finishedAt: now() },
     repository: input.repository,
     ...(input.accountId ? { accountId: input.accountId } : {}),
     ...(input.connectedStorageId != null ? { connectedStorageId: input.connectedStorageId } : {}),
+    priorObtained: localObtained,
   });
   return bridged;
+}
+
+/**
+ * The engine's season result as THIS drive's records (issue #369). The engine sees
+ * every episode obtained on any drive as had and returns them obtained with no file
+ * ids. Written as-is, a patrol would mark another drive's episodes obtained on this
+ * one and empty the file ids this drive recorded. So an episode only another drive
+ * has stays as this drive had it, and one this drive had keeps its file ids.
+ */
+function keepDriveLocalRecords(
+  seasonResult: BridgedV2Result["seasons"][number],
+  localEpisodes: readonly EpisodeState[],
+  elsewhereOnly: ReadonlySet<string>,
+): BridgedV2Result["seasons"][number] {
+  const local = new Map(localEpisodes.map((episode) => [episode.episodeCode, episode]));
+  const episodes: EpisodeState[] = [];
+  for (const episode of seasonResult.episodes) {
+    const mine = local.get(episode.episodeCode);
+    if (episode.obtained && elsewhereOnly.has(episode.episodeCode)) {
+      // A provider-ahead row past the season's range exists only because it was had.
+      if (!mine && episode.metadataStatus === "provider_ahead") continue;
+      episodes.push({ ...episode, obtained: false, metadataStatus: mine?.metadataStatus ?? "confirmed", verifiedFileIds: [] });
+    } else if (episode.obtained && mine?.obtained && episode.verifiedFileIds.length === 0) {
+      episodes.push({ ...episode, verifiedFileIds: [...mine.verifiedFileIds] });
+    } else {
+      episodes.push(episode);
+    }
+  }
+  return { ...seasonResult, episodes };
 }
 
 export async function runSeriesInitializationV2AndPersist(
@@ -930,6 +1108,17 @@ export async function runReplaceRequestV2AndPersist(
     ...(input.connectedStorageId !== undefined ? { connectedStorageId: input.connectedStorageId } : {}),
   };
   const finishedAt = now();
+  // What each season held before the run: those episodes did not land now. One the
+  // agent reported replaced did — its new file is attributed like any landing.
+  const replaced = new Set(
+    (bridged.replacement?.results ?? []).filter((r) => r.outcome === "replaced").map((r) => r.episode),
+  );
+  const heldBefore = (seasonNumber: number): ReadonlySet<string> =>
+    new Set(
+      (input.seasons.find((entry) => entry.season.seasonNumber === seasonNumber)?.episodes ?? [])
+        .filter((episode) => episode.obtained && !replaced.has(episode.episodeCode))
+        .map((episode) => episode.episodeCode),
+    );
   const allReplaceCopies: EpisodeCopy[] = [];
   for (const seasonResult of bridged.seasons) {
     if (seasonResult === lock) continue;
@@ -945,6 +1134,7 @@ export async function runReplaceRequestV2AndPersist(
       seasonResult,
       touchedTargetDrives: bridged.touchedTargetDrives,
       getScans,
+      priorObtained: heldBefore(seasonResult.season.seasonNumber),
     });
     await input.repository.saveWorkflowRunSnapshot({
       ...owner,
@@ -975,6 +1165,7 @@ export async function runReplaceRequestV2AndPersist(
       runId,
       recordedAt: finishedAt,
       getScans,
+      priorObtained: heldBefore(seasonResult.season.seasonNumber),
     });
     allReplaceCopies.push(...copies);
   }
@@ -989,6 +1180,7 @@ export async function runReplaceRequestV2AndPersist(
     seasonResult: lock,
     touchedTargetDrives: bridged.touchedTargetDrives,
     getScans: getLockScans,
+    priorObtained: heldBefore(lock.season.seasonNumber),
   });
   const lockCopies = await recordTouchedSeasonCopies({
     repository: input.repository,
@@ -1000,6 +1192,7 @@ export async function runReplaceRequestV2AndPersist(
     runId: input.workflowRun.id,
     recordedAt: finishedAt,
     getScans: getLockScans,
+    priorObtained: heldBefore(lock.season.seasonNumber),
   });
   allReplaceCopies.push(...lockCopies);
   const enrichedReplaceNotifications = appendMultiDriveBreakdownToNotifications(
@@ -1092,6 +1285,13 @@ export async function runStagingRecoveryV2AndPersist(
   const accountId = input.accountId ?? DEFAULT_ACCOUNT_ID;
   const primaryStorageId =
     input.connectedStorageId ?? bridged.touchedTargetDrives?.[0]?.storageId ?? null;
+  // What each season held before the recovery: only what the leftover added landed now.
+  const heldBefore = (seasonNumber: number): ReadonlySet<string> =>
+    new Set(
+      (input.seasons.find((entry) => entry.season.seasonNumber === seasonNumber)?.episodes ?? [])
+        .filter((episode) => episode.obtained)
+        .map((episode) => episode.episodeCode),
+    );
   for (const seasonResult of bridged.seasons) {
     if (seasonResult === lock) continue;
     const runId = `${input.workflowRun.id}_s${seasonResult.season.seasonNumber}`;
@@ -1124,6 +1324,7 @@ export async function runStagingRecoveryV2AndPersist(
       touchedTargetDrives: bridged.touchedTargetDrives,
       runId,
       recordedAt: finishedAt,
+      priorObtained: heldBefore(seasonResult.season.seasonNumber),
     });
   }
   await input.repository.saveWorkflowRunSnapshot({
@@ -1155,6 +1356,7 @@ export async function runStagingRecoveryV2AndPersist(
     touchedTargetDrives: bridged.touchedTargetDrives,
     runId: input.workflowRun.id,
     recordedAt: finishedAt,
+    priorObtained: heldBefore(lock.season.seasonNumber),
   });
   return { ...bridged, notifications: [] };
 }
